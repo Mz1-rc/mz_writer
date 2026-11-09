@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { BookStore } from "./state.ts";
 import { chapterKey } from "./paths.ts";
-import type { Phase } from "./types.ts";
+import type { Phase, RunUsage } from "./types.ts";
 
 const STATUS_KEY = "writing-team";
 const WIDGET_KEY = "writing-team";
@@ -33,18 +33,53 @@ export function phaseLabel(phase: Phase): string {
 	return labels[phase] ?? phase;
 }
 
+export function formatTokens(n: number | undefined): string {
+	const value = Number(n) || 0;
+	if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+	if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+	return String(Math.round(value));
+}
+
+function formatCost(n: number | undefined): string {
+	const value = Number(n) || 0;
+	if (value <= 0) return "";
+	return value >= 1 ? `$${value.toFixed(2)}` : `$${value.toFixed(4)}`;
+}
+
+function addUsage(base: RunUsage, extra?: RunUsage): RunUsage {
+	const baseTotal = base.total ?? (base.input ?? 0) + (base.output ?? 0);
+	const extraTotal = extra ? (extra.total ?? (extra.input ?? 0) + (extra.output ?? 0)) : 0;
+	return {
+		input: (base.input ?? 0) + (extra?.input ?? 0),
+		output: (base.output ?? 0) + (extra?.output ?? 0),
+		total: baseTotal + extraTotal,
+		cost: (base.cost ?? 0) + (extra?.cost ?? 0),
+	};
+}
+
 function progressBar(done: number, total: number, width = 16): string {
 	if (total <= 0) return "";
 	const filled = Math.max(0, Math.min(width, Math.round((done / total) * width)));
 	return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
 }
 
-export function updateStatus(ctx: ExtensionContext, store: BookStore, progress?: string): void {
+export function updateStatus(
+	ctx: ExtensionContext,
+	store: BookStore,
+	progress?: string,
+	activeUsage?: RunUsage,
+): void {
 	const book = store.book;
+	const total = addUsage(book.stats.totalUsage ?? { input: 0, output: 0, cost: 0 }, activeUsage);
+	const totalTokens = total.total ?? total.input + total.output;
 	const chapterText = book.chapterCount > 0 ? `第 ${book.currentChapter}/${book.chapterCount} 章` : "筹备中";
 	const words = book.stats.words > 0 ? ` · ${book.stats.words.toLocaleString()} 字` : "";
+	const auto = book.config.defaults.fullAuto ? " · ⚡AUTO" : "";
 	const extra = progress ? ` · ${progress}` : "";
-	ctx.ui.setStatus(STATUS_KEY, `📖 ${book.title} · ${chapterText}${words}${extra}`);
+	ctx.ui.setStatus(
+		STATUS_KEY,
+		`📖 ${book.title} · ${chapterText}${words}${auto} · Σ${formatTokens(totalTokens)} tok${extra}`,
+	);
 
 	const lines: string[] = [];
 	const design = book.gates.design.status === "approved" ? "✔ 设计" : "○ 设计";
@@ -60,6 +95,10 @@ export function updateStatus(ctx: ExtensionContext, store: BookStore, progress?:
 	} else {
 		lines.push(`当前：${phaseLabel(book.phase)}`);
 	}
+	const cost = formatCost(total.cost);
+	lines.push(
+		`Token：总 ${formatTokens(totalTokens)}（入 ${formatTokens(total.input)} / 出 ${formatTokens(total.output)}）${cost ? ` · ${cost}` : ""}${activeUsage ? ` · 本角色 ${formatTokens((activeUsage.input ?? 0) + (activeUsage.output ?? 0))}` : ""}`,
+	);
 	if (progress) lines.push(progress);
 	ctx.ui.setWidget(WIDGET_KEY, lines);
 }
@@ -79,16 +118,6 @@ export function clearStatus(ctx: ExtensionContext): void {
 
 export function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
 	ctx.ui.notify(message, type);
-}
-
-export async function showText(ctx: ExtensionContext, title: string, text: string): Promise<void> {
-	if (!ctx.hasUI) {
-		notify(ctx, `${title}：${text.slice(0, 200)}...`, "info");
-		return;
-	}
-	// The built-in editor is a convenient scrollable viewer. The returned edits
-	// are intentionally discarded; artifacts are only changed by save_artifact.
-	await ctx.ui.editor(`${title}（Esc 返回，不会保存）`, text);
 }
 
 export function chapterStatusLine(store: BookStore, n: number): string {

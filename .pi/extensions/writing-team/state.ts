@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { chapterKey, countChars, ensureDir, fileStat, isStale, nowIso, readJson, slugify, timestampForId, writeJsonAtomic } from "./paths.ts";
+import { DEFAULT_CONFIG, deepMerge } from "./config.ts";
 import type {
 	BookProject,
 	GateId,
@@ -51,7 +52,7 @@ function emptyGate(): GateRecord {
 }
 
 export function emptyUsage(): RunUsage {
-	return { input: 0, output: 0, cost: 0 };
+	return { input: 0, output: 0, total: 0, cost: 0 };
 }
 
 export function booksRoot(workspace: string, config: TeamConfig): string {
@@ -137,6 +138,7 @@ export class BookStore {
 		if (!chosen) throw new Error(`找不到书籍项目: ${slug}`);
 		const book = readJson<BookProject>(join(chosen.path));
 		if (!book || book.schemaVersion !== 1) throw new Error(`书籍状态文件损坏: ${chosen.path}`);
+		normalizeBookConfig(book);
 		const store = new BookStore(join(booksRoot(workspace, config), chosen.slug), book);
 		store.markInterruptedRuns();
 		return store;
@@ -145,6 +147,7 @@ export class BookStore {
 	static loadByPath(root: string): BookStore {
 		const book = readJson<BookProject>(join(root, "book.json"));
 		if (!book || book.schemaVersion !== 1) throw new Error(`书籍状态文件损坏: ${root}`);
+		normalizeBookConfig(book);
 		const store = new BookStore(root, book);
 		store.markInterruptedRuns();
 		return store;
@@ -282,9 +285,11 @@ export class BookStore {
 		Object.assign(run, patch);
 		run.endedAt = nowIso();
 		if (run.usage) {
-			this.book.stats.totalUsage.input += run.usage.input;
-			this.book.stats.totalUsage.output += run.usage.output;
-			this.book.stats.totalUsage.cost = (this.book.stats.totalUsage.cost ?? 0) + (run.usage.cost ?? 0);
+			const usage = this.book.stats.totalUsage;
+			usage.total = (usage.total ?? usage.input + usage.output) + (run.usage.total ?? run.usage.input + run.usage.output);
+			usage.input += run.usage.input;
+			usage.output += run.usage.output;
+			usage.cost = (usage.cost ?? 0) + (run.usage.cost ?? 0);
 		}
 		this.save();
 	}
@@ -398,6 +403,14 @@ export class BookStore {
 		if (!info?.pid || !stat) return false;
 		return isProcessAlive(info.pid) && !isStale(stat.mtimeMs);
 	}
+}
+
+function normalizeBookConfig(book: BookProject): void {
+	if (!book.config || typeof book.config !== "object") {
+		book.config = structuredClone(DEFAULT_CONFIG);
+		return;
+	}
+	book.config = deepMerge(DEFAULT_CONFIG, book.config);
 }
 
 function isProcessAlive(pid: number): boolean {

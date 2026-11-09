@@ -15,6 +15,7 @@ export const DEFAULT_CONFIG: TeamConfig = {
 		enableBetaReader: false,
 		chapterWords: 3200,
 		totalWords: 80000,
+		fullAuto: false,
 	},
 	roles: {},
 };

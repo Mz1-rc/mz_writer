@@ -937,3 +937,12 @@ Widget（编辑器上方）：
 ---
 
 **当前状态：已按第 14 节的推荐默认值实施。实现与使用说明见 `.pi/extensions/writing-team/README.md`。**
+
+---
+
+## 16. v0.2 增补（已实施）
+
+- **实时运行信息**：子 Agent 运行期间，状态栏与进度 Widget 实时显示上下文占用、当前工具操作、当前角色累计 token。
+- **项目级 Token 统计**：`book.json` 的 `stats.totalUsage` 累计所有角色的 input / output / cost；状态栏、`/book status`、`writing_team` 工具结果都会显示。
+- **全自动模式**：新增 `defaults.fullAuto`、`/book auto on|off`、`/book auto-run`，以及 `writing_team` 的 `set_auto` / `run_all`。全自动模式跳过人工闸门，但仍执行产出校验；校验失败会暂停，而不是强行通过。终审为 `VERDICT: REVISE` 时带问题交付并警告。
+- **确认闸门不展示全文**：G1/G2/G3/G4 都不展示工件全文，只显示摘要、字数和文件路径（如 `design.md`、`outline.md`、`final.md`、`reviews/final-review.md`），由用户自行打开确认。

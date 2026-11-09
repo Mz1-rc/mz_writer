@@ -22,6 +22,8 @@ const ACTIONS = [
 	"configure",
 	"pause",
 	"resume",
+	"set_auto",
+	"run_all",
 ] as const;
 
 export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): void {
@@ -34,6 +36,7 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 		promptGuidelines: [
 			"Use writing_team when the user asks to start, continue, review, or export a long-form writing project.",
 			"Call writing_team with one action at a time; never run multiple writing_team calls in parallel.",
+			"Use writing_team set_auto and run_all only when the user explicitly asks for fully automatic operation without gate confirmations.",
 			"When writing_team returns a gate or a summary, ask the user to confirm before advancing again.",
 		],
 		parameters: Type.Object({
@@ -48,6 +51,7 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 					description: "configure 时的思考等级",
 				}),
 			),
+			auto: Type.Optional(Type.Boolean({ description: "set_auto 时是否开启全自动模式" })),
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -149,6 +153,22 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 						updateStatus(ctx, store);
 						return toolResult(store);
 					}
+					case "set_auto": {
+						const { store } = app.ensure(ctx);
+						store.book.config.defaults.fullAuto = params.auto ?? true;
+						store.save();
+						updateStatus(ctx, store);
+						return toolResult(store);
+					}
+					case "run_all": {
+						const { store } = app.ensure(ctx);
+						if (!store.book.config.defaults.fullAuto) {
+							store.book.config.defaults.fullAuto = true;
+							store.save();
+							notify(ctx, "已自动开启全自动模式，开始运行剩余流程。", "warning");
+						}
+						return withPipeline(ctx, app, (pipeline) => pipeline.runAll());
+					}
 					default:
 						throw new Error(`未知 action: ${action}`);
 				}
@@ -184,11 +204,14 @@ async function withPipeline(
 
 function toolResult(store: import("./state.ts").BookStore) {
 	const book = store.book;
+	const totalTokens = book.stats.totalUsage?.total ?? (book.stats.totalUsage?.input ?? 0) + (book.stats.totalUsage?.output ?? 0);
 	const text = [
 		`《${book.title}》`,
 		`阶段：${book.phase}`,
 		`章节：第 ${book.currentChapter}/${book.chapterCount || "?"} 章`,
 		`字数：${book.stats.words}`,
+		`Token：总 ${totalTokens}（入 ${book.stats.totalUsage?.input ?? 0} / 出 ${book.stats.totalUsage?.output ?? 0}）`,
+		`模式：${book.config.defaults.fullAuto ? "全自动" : "人工确认"}`,
 		`闸门：设计=${book.gates.design.status}, 大纲=${book.gates.outline.status}, 终审=${book.gates.final.status}`,
 		book.lastError ? `最近错误：${book.lastError.message}` : "",
 	]
@@ -204,6 +227,8 @@ function toolResult(store: import("./state.ts").BookStore) {
 			currentChapter: book.currentChapter,
 			chapterCount: book.chapterCount,
 			words: book.stats.words,
+			totalTokens,
+			fullAuto: book.config.defaults.fullAuto,
 			gates: book.gates,
 			root: store.root,
 			lastError: book.lastError,

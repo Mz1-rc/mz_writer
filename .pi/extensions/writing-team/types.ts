@@ -67,6 +67,8 @@ export interface TeamConfig {
 		enableBetaReader: boolean;
 		chapterWords: number;
 		totalWords: number;
+		/** 全自动模式：跳过人工闸门确认（仍执行产出校验）。 */
+		fullAuto: boolean;
 	};
 	roles: Partial<Record<RoleId, RoleConfig>>;
 }
@@ -95,6 +97,8 @@ export interface GateRecord {
 export interface RunUsage {
 	input: number;
 	output: number;
+	/** 供应商报告的 total tokens；缺失时用 input + output。 */
+	total?: number;
 	cost?: number;
 }
 
@@ -181,10 +185,18 @@ export interface RoleMeta {
 }
 
 export interface ProgressUpdate {
-	kind: "text" | "tool" | "status";
+	kind: "text" | "tool" | "usage" | "status";
 	text?: string;
 	chars?: number;
 	toolName?: string;
+	/** 面向用户的操作详情，例如“读取 chapters/ch001/final.md”。 */
+	detail?: string;
+	/** 子 Agent 当前上下文 token 数。 */
+	contextTokens?: number;
+	contextWindow?: number;
+	contextPercent?: number;
+	/** 当前子 Agent 目前为止的累计用量（不是整个项目）。 */
+	usage?: RunUsage;
 }
 
 export interface RoleRunResult {

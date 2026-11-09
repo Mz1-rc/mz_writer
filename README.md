@@ -22,6 +22,12 @@ pi
 
 之后按闸门提示使用 `/book approve`、`/book revise <意见>`、`/book next` 推进。
 
+需要全程无人值守时：
+
+```text
+/book auto-run
+```
+
 ## 测试
 
 ```bash

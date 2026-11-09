@@ -3,7 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveWithin } from "./paths.ts";
 import type { BookStore } from "./state.ts";
 import type { GateId } from "./types.ts";
-import { notify, showText } from "./ui.ts";
+import { notify } from "./ui.ts";
 
 export type GateDecision =
 	| { kind: "approve" }
@@ -20,6 +20,8 @@ export interface GateOptions {
 	maxRevisionRounds?: number;
 	/** 产出缺失或不合格时禁止直接通过。 */
 	allowApprove?: boolean;
+	/** 全自动模式下是否允许通过；false 表示校验失败，自动模式应暂停。 */
+	validationOk?: boolean;
 }
 
 export function gateArtifactPaths(gate: GateId, chapter?: number): string[] {
@@ -80,6 +82,19 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 	const verdict = /VERDICT:\s*REVISE/i.test(reviewText) ? "REVISE" : "PASS";
 	const allowApprove = options.allowApprove !== false && (options.gate !== "final" || hasVerdict);
 
+	if (book.config.defaults.fullAuto) {
+		if (!allowApprove || options.validationOk === false) {
+			notify(ctx, `全自动模式：${gateName} 的产出未通过校验，已暂停。请修复后继续。`, "error");
+			return { kind: "pause" };
+		}
+		if (options.gate === "final" && verdict === "REVISE") {
+			notify(ctx, "全自动模式：主编结论为 VERDICT: REVISE，将带问题交付。", "warning");
+		} else {
+			notify(ctx, `全自动模式：自动通过${gateName}。`, "info");
+		}
+		return { kind: "approve" };
+	}
+
 	while (true) {
 		const roundHint = round > 0 ? `已修改 ${round}/${maxRounds} 轮` : "尚未修改";
 		const optionsList: string[] = [];
@@ -91,7 +106,6 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 			optionsList.push("提出修改");
 		}
 		if (options.gate === "outline") optionsList.push("调整章数与节奏");
-		optionsList.push("查看全文");
 		optionsList.push("暂停");
 		optionsList.push("放弃本项目");
 		if (options.gate === "final") {
@@ -138,11 +152,7 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 			return { kind: "chapter_rework", chapter: chapterNo, feedback: feedback.trim() };
 		}
 
-		if (choice === "查看全文") {
-			const text = readFiles(store, gateArtifactPaths(options.gate, chapter));
-			await showText(ctx, `${gateName} - 全文`, text || "（没有可查看的工件）");
-			continue;
-		}
+
 
 		if (choice === "暂停") return { kind: "pause" };
 		if (choice === "放弃本项目") {

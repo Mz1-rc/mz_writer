@@ -141,3 +141,75 @@ test("fake runner completes the whole pipeline with gates, never in parallel", a
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("full-auto mode completes without any gate UI", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "wt-auto-test-"));
+	try {
+		const config = structuredClone(DEFAULT_CONFIG);
+		config.defaults.thinkingLevel = "off";
+		config.defaults.enableWorldbuilder = "never";
+		config.defaults.enableBetaReader = false;
+		config.defaults.autoRunChapterPipeline = true;
+		config.defaults.chapterGate = "each";
+		config.defaults.chapterWords = 400;
+		config.defaults.totalWords = 800;
+		config.defaults.fullAuto = true;
+		const store = createBook(dir, "全自动测试", intake(), config);
+		store.transition("design");
+
+		const fakeRunner = async (options: RoleRunOptions): Promise<RoleRunResult> => {
+			for (const target of options.targets) {
+				const path = join(options.bookRoot, target);
+				mkdirSync(dirname(path), { recursive: true });
+				writeFileSync(path, contentFor(options.role, target));
+			}
+			return {
+				finalText: `${options.role} done`,
+				usage: { input: 10, output: 5, cost: 0.001 },
+				outputs: options.targets,
+				model: "fake/model",
+				thinkingLevel: "off",
+			};
+		};
+
+		let selectCalls = 0;
+		const ui = {
+			input: async () => "1",
+			editor: async (_title: string, prefill?: string) => prefill ?? "",
+			select: async () => {
+				selectCalls++;
+				throw new Error("full-auto must not show a gate");
+			},
+			confirm: async () => {
+				throw new Error("full-auto must not show a confirmation");
+			},
+			notify: () => {},
+			setStatus: () => {},
+			setWidget: () => {},
+		};
+		const ctx = {
+			cwd: dir,
+			ui,
+			hasUI: true,
+			mode: "tui",
+			signal: undefined,
+			isIdle: () => true,
+			scopedModels: [],
+			modelRegistry: { getAll: () => [], getAvailable: () => [], find: () => undefined },
+			sessionManager: {},
+			model: undefined,
+		};
+
+		const pipeline = new WritingPipeline(ctx as any, store, config, undefined, fakeRunner);
+		await pipeline.runAll();
+
+		assert.equal(store.book.phase, "done");
+		assert.equal(selectCalls, 0);
+		assert.equal(store.book.stats.chaptersCompleted, 2);
+		assert.ok(existsSync(join(store.root, "exports", "latest.md")));
+		assert.ok((store.book.stats.totalUsage.input ?? 0) > 0);
+		assert.ok((store.book.stats.totalUsage.output ?? 0) > 0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

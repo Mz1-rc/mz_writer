@@ -8,17 +8,40 @@ import {
 import { ArtifactManager } from "./artifacts.ts";
 import { createSaveArtifactTool } from "./artifact-tool.ts";
 import { ensureDir } from "./paths.ts";
-import type { RoleRunOptions, RoleRunResult, RunUsage } from "./types.ts";
+import type { ProgressUpdate, RoleRunOptions, RoleRunResult, RunUsage } from "./types.ts";
 
 function emptyUsage(): RunUsage {
-	return { input: 0, output: 0, cost: 0 };
+	return { input: 0, output: 0, total: 0, cost: 0 };
 }
 
 function addUsage(total: RunUsage, usage: any): void {
 	if (!usage) return;
-	total.input += Number(usage.input) || 0;
-	total.output += Number(usage.output) || 0;
+	const input = Number(usage.input) || 0;
+	const output = Number(usage.output) || 0;
+	const cacheRead = Number(usage.cacheRead) || 0;
+	const cacheWrite = Number(usage.cacheWrite) || 0;
+	total.input += input;
+	total.output += output;
+	total.total = (total.total ?? 0) + (Number(usage.totalTokens) || input + output + cacheRead + cacheWrite);
 	total.cost = (total.cost ?? 0) + (Number(usage.cost?.total) || 0);
+}
+
+function describeTool(toolName: string, args: any): string {
+	const a = args && typeof args === "object" ? args : {};
+	switch (toolName) {
+		case "read":
+			return `读取 ${a.path ?? "文件"}`;
+		case "grep":
+			return `搜索「${a.pattern ?? ""}」${a.path ? ` @ ${a.path}` : ""}`;
+		case "find":
+			return `查找 ${a.pattern ?? ""}${a.path ? ` @ ${a.path}` : ""}`;
+		case "ls":
+			return `列出 ${a.path ?? "."}`;
+		case "save_artifact":
+			return `保存 ${a.target ?? "工件"}（${String(a.content ?? "").length} 字符）`;
+		default:
+			return toolName;
+	}
 }
 
 /**
@@ -56,7 +79,11 @@ export async function runRole(options: RoleRunOptions): Promise<RoleRunResult> {
 	await loader.reload();
 
 	const manager = new ArtifactManager(options.bookRoot, options.runDir, options.targets);
-	const artifactTool = createSaveArtifactTool(manager, options.onWrite);
+	let emit: (update: ProgressUpdate) => void = (update) => options.onProgress?.(update);
+	const artifactTool = createSaveArtifactTool(manager, (target, chars) => {
+		options.onWrite?.(target, chars);
+		emit({ kind: "tool", toolName: "save_artifact", detail: `已保存 ${target}（${chars} 字）` });
+	});
 
 	const { session } = await createAgentSession({
 		cwd: options.bookRoot,
@@ -73,17 +100,47 @@ export async function runRole(options: RoleRunOptions): Promise<RoleRunResult> {
 	let streamedChars = 0;
 	let preview = "";
 	const usage = emptyUsage();
+	let lastContextAt = 0;
+	let cachedContext: ReturnType<typeof session.getContextUsage> | undefined;
+	emit = (update) => {
+		const now = Date.now();
+		if (update.kind !== "text" || now - lastContextAt >= 500) {
+			try {
+				cachedContext = session.getContextUsage();
+			} catch {
+				cachedContext = undefined;
+			}
+			lastContextAt = now;
+		}
+		options.onProgress?.({
+			...update,
+			usage: { input: usage.input, output: usage.output, total: usage.total, cost: usage.cost },
+			contextTokens: cachedContext?.tokens ?? undefined,
+			contextWindow: cachedContext?.contextWindow,
+			contextPercent: cachedContext?.percent ?? undefined,
+		});
+	};
 	const unsubscribe = session.subscribe((event: any) => {
 		try {
 			if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
 				const delta = String(event.assistantMessageEvent.delta ?? "");
 				streamedChars += delta.length;
 				preview = `${preview}${delta}`.slice(-160);
-				options.onProgress?.({ kind: "text", chars: streamedChars, text: preview });
+				emit({ kind: "text", chars: streamedChars, text: preview, detail: `生成中 ${streamedChars} 字` });
 			} else if (event.type === "tool_execution_start") {
-				options.onProgress?.({ kind: "tool", toolName: event.toolName });
+				emit({ kind: "tool", toolName: event.toolName, detail: describeTool(event.toolName, event.args) });
+			} else if (event.type === "tool_execution_end") {
+				const duration = event.durationMs ? ` · ${event.durationMs}ms` : "";
+				emit({
+					kind: "tool",
+					toolName: event.toolName,
+					detail: `${event.toolName} ${event.isError ? "失败" : "完成"}${duration}`,
+				});
 			} else if (event.type === "message_end" && event.message?.role === "assistant") {
 				addUsage(usage, event.message.usage);
+				emit({ kind: "usage", detail: "用量更新" });
+			} else if (event.type === "agent_settled") {
+				emit({ kind: "status", detail: "角色运行完成" });
 			}
 		} catch {
 			// Progress observers must never break the role run.

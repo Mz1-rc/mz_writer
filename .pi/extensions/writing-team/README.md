@@ -51,6 +51,8 @@ pi -e ./.pi/extensions/writing-team/index.ts
 | `/book rewind <阶段>` | 回滚到 `design` / `outline` / `chapter_plan` / `final_review` |
 | `/book models` | 为角色选择模型和 thinking level |
 | `/book config` | 查看配置 |
+| `/book auto on\|off` | 开启/关闭全自动模式（闸门自动通过） |
+| `/book auto-run` | 全自动跑完剩余流程 |
 | `/book pause` / `/book resume` | 暂停 / 恢复 |
 | `/book abort` | 请求中止当前角色运行（也可按 Esc） |
 | `/book export` | 导出 Markdown 成稿 |
@@ -58,7 +60,15 @@ pi -e ./.pi/extensions/writing-team/index.ts
 | `/book open [slug]` | 列出或切换书籍项目 |
 | `/book help` | 帮助 |
 
-主 Agent 还可以调用 `writing_team` 工具，用自然语言驱动同一套流程。工具设置了 `executionMode: "sequential"`，并明确要求一次只推进一个阶段。
+全自动模式：
+
+- `/book auto on` 后，所有闸门自动通过，产出校验失败时自动暂停；
+- `/book auto-run` 会开启全自动并直接跑完剩余流程；
+- 最终审稿为 `VERDICT: REVISE` 时，全自动模式会带问题交付并给出警告；
+- 所有确认闸门都不展示全文，只列出 `design.md`、`outline.md`、`final.md`、`reviews/final-review.md` 等文件路径，方便你自行打开确认；
+- 全自动模式仍然执行角色输出校验、字数校验、JSON 校验和归档检查，不会跳过质量底线。
+
+主 Agent 还可以调用 `writing_team` 工具，用自然语言驱动同一套流程。工具设置了 `executionMode: "sequential"`，并明确要求一次只推进一个阶段。全自动相关 action：`set_auto`、`run_all`。
 
 ## 角色
 
@@ -94,7 +104,8 @@ pi -e ./.pi/extensions/writing-team/index.ts
     "enableWorldbuilder": "auto",
     "enableBetaReader": false,
     "chapterWords": 3200,
-    "totalWords": 80000
+    "totalWords": 80000,
+    "fullAuto": false
   },
   "roles": {
     "architect": { "model": "provider/model-a", "thinkingLevel": "high" },
@@ -139,10 +150,23 @@ books/<slug>/
 
 `book.json` 是状态机与配置；`.runs` 是每次运行的输入、输出、模型和用量记录；正式工件由 `save_artifact` 原子写入。
 
+## 实时进度与 Token 统计
+
+子 Agent 运行期间，底部状态栏和进度 Widget 会实时显示：
+
+- 当前角色；
+- 子 Agent 上下文占用，例如 `ctx 42.3k/128.0k (33%)`；
+- 当前操作，例如 `读取 chapters/ch001/final.md`、`搜索「伏笔」 @ continuity/threads.md`、`保存 chapters/ch001/final.md（4,120 字符）`；
+- 当前角色累计 input/output token；
+- 整个项目累计 token 与成本。
+
+项目累计用量保存在 `book.json` 的 `stats.totalUsage`，每次角色的精确用量保存在 `.runs/<runId>/meta.json`。
+
 ## 线性与安全
 
 - 角色运行在 `createAgentSession()` 创建的独立内存会话中，一次 `await` 一个；
 - 角色只有 `read`、`grep`、`find`、`ls` 和受控的 `save_artifact`，没有 `bash` / `edit` / `write`；
+- 子 Agent 运行时会实时上报上下文大小和工具操作详情；
 - `save_artifact` 只允许写本次角色的声明目标，并拒绝 `..` 路径越界；
 - 每个项目有 `.lock` 跨进程锁，避免两个终端同时写；
 - 每次运行前 `book.json` 记录运行状态，崩溃后未完成运行标记为 `interrupted`，阶段不前进；
@@ -166,7 +190,8 @@ node --experimental-strip-types --test tests/*.test.ts
 
 ## 已知限制
 
-- 闸门依赖交互式 TUI；在 print / JSON 模式下会返回暂停；
+- 人工确认闸门依赖交互式 TUI；在 print / JSON 模式下会返回暂停；全自动模式不需要 UI；
+- 全自动模式在产出校验失败时会暂停，而不是强行通过；
 - 导出目前只支持 Markdown；
 - 嵌套会话沿用 Pi 的模型认证，不额外复用主会话的临时 API key 覆盖；
 - 角色不会自动联网查资料，设定以已确认工件为准。

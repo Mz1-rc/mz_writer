@@ -3,7 +3,7 @@ import type { WritingTeamApp } from "./app.ts";
 import { runDoctor } from "./doctor.ts";
 import { roleLabel } from "./roles.ts";
 import { WritingPipeline } from "./pipeline.ts";
-import { updateStatus, notify } from "./ui.ts";
+import { formatTokens, updateStatus, notify } from "./ui.ts";
 import { ROLE_IDS, type RoleId, type ThinkingLevel } from "./types.ts";
 
 const SUBCOMMANDS = [
@@ -18,6 +18,8 @@ const SUBCOMMANDS = [
 	"rewind",
 	"models",
 	"config",
+	"auto",
+	"auto-run",
 	"pause",
 	"resume",
 	"abort",
@@ -85,6 +87,12 @@ export async function handleBookCommand(args: string, ctx: ExtensionCommandConte
 				return;
 			case "config":
 				showConfig(ctx, app);
+				return;
+			case "auto":
+				setAutoMode(ctx, app, rest);
+				return;
+			case "auto-run":
+				await runAll(ctx, app);
 				return;
 			case "pause":
 				await withPipeline(ctx, app, async (pipeline) => {
@@ -222,6 +230,8 @@ function showStatus(ctx: ExtensionCommandContext, app: WritingTeamApp): void {
 		currentRun ? `运行中：${roleLabel(currentRun.role)}（${currentRun.startedAt}）` : "运行中：无",
 		book.lastError ? `最近错误：${book.lastError.message}` : "",
 		`目录：${store.root}`,
+		`模式：${book.config.defaults.fullAuto ? "⚡ 全自动（闸门自动通过）" : "人工确认"}`,
+		`Token：总 ${formatTokens(book.stats.totalUsage?.total ?? ((book.stats.totalUsage?.input ?? 0) + (book.stats.totalUsage?.output ?? 0)))}（入 ${formatTokens(book.stats.totalUsage?.input)} / 出 ${formatTokens(book.stats.totalUsage?.output)}）`,
 		`模型覆盖：${Object.entries(config.roles)
 			.filter(([, value]) => value?.model)
 			.map(([key, value]) => `${key}=${value?.model}`)
@@ -402,6 +412,8 @@ function showHelp(ctx: ExtensionCommandContext): void {
 		"/book rewind <阶段>   回滚到 design / outline / chapter_plan / final_review",
 		"/book models          为角色配置模型与思考等级",
 		"/book config          查看配置",
+		"/book auto on|off     开启/关闭全自动模式（闸门不确认）",
+		"/book auto-run        全自动跑完剩余流程",
 		"/book pause|resume    暂停 / 恢复",
 		"/book abort           中止当前角色运行",
 		"/book export          导出 Markdown 成稿",
@@ -412,6 +424,36 @@ function showHelp(ctx: ExtensionCommandContext): void {
 		`角色：${ROLE_IDS.join(", ")}`,
 	].join("\n");
 	notify(ctx, text, "info");
+}
+
+async function setAutoMode(ctx: ExtensionCommandContext, app: WritingTeamApp, arg: string): Promise<void> {
+	const { store } = app.ensure(ctx);
+	const value = arg.trim().toLowerCase();
+	if (value === "on" || value === "true" || value === "1") store.book.config.defaults.fullAuto = true;
+	else if (value === "off" || value === "false" || value === "0") store.book.config.defaults.fullAuto = false;
+	else {
+		notify(ctx, `全自动模式当前为 ${store.book.config.defaults.fullAuto ? "开启" : "关闭"}。用法：/book auto on|off`, "info");
+		return;
+	}
+	store.save();
+	updateStatus(ctx, store);
+	notify(
+		ctx,
+		store.book.config.defaults.fullAuto
+			? "⚡ 全自动模式已开启：闸门将自动通过，产出校验失败时会暂停。"
+			: "全自动模式已关闭：闸门需要人工确认。",
+		"info",
+	);
+}
+
+async function runAll(ctx: ExtensionCommandContext, app: WritingTeamApp): Promise<void> {
+	const { store } = app.ensure(ctx);
+	if (!store.book.config.defaults.fullAuto) {
+		store.book.config.defaults.fullAuto = true;
+		store.save();
+		notify(ctx, "⚡ 已自动开启全自动模式并开始运行。", "warning");
+	}
+	await withPipeline(ctx, app, (pipeline) => pipeline.runAll());
 }
 
 function splitList(text: string): string[] {
