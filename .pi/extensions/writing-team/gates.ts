@@ -22,6 +22,8 @@ export interface GateOptions {
 	allowApprove?: boolean;
 	/** 全自动模式下是否允许通过；false 表示校验失败，自动模式应暂停。 */
 	validationOk?: boolean;
+	/** 用于 /book abort 关闭闸门对话框。 */
+	signal?: AbortSignal;
 }
 
 export function gateArtifactPaths(gate: GateId, chapter?: number): string[] {
@@ -116,6 +118,7 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 		const choice = await ctx.ui.select(
 			`${title}\n\n${summary}\n\n（${roundHint}）`,
 			optionsList,
+			{ signal: options.signal },
 		);
 		if (!choice) return { kind: "pause" };
 
@@ -125,20 +128,20 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 				continue;
 			}
 			if (options.gate === "final") {
-				const ok = await ctx.ui.confirm("确认交付", "确认后将导出成稿并标记项目完成。是否继续？");
+				const ok = await ctx.ui.confirm("确认交付", "确认后将导出成稿并标记项目完成。是否继续？", { signal: options.signal });
 				if (!ok) continue;
 			}
 			return { kind: "approve" };
 		}
 
 		if (choice === "带问题交付（不推荐）") {
-			const ok = await ctx.ui.confirm("带问题交付", "主编认为仍需修改。确认忽略问题并交付？");
+			const ok = await ctx.ui.confirm("带问题交付", "主编认为仍需修改。确认忽略问题并交付？", { signal: options.signal });
 			if (ok) return { kind: "approve" };
 			continue;
 		}
 
 		if (choice === "指定章节返工") {
-			const raw = await ctx.ui.input("指定章节返工", `输入章节号（1-${book.chapterCount}）`);
+			const raw = await ctx.ui.input("指定章节返工", `输入章节号（1-${book.chapterCount}）`, { signal: options.signal });
 			const chapterNo = Number(raw);
 			if (!Number.isInteger(chapterNo) || chapterNo < 1 || chapterNo > book.chapterCount) {
 				notify(ctx, "章节号无效，返回闸门。", "warning");
@@ -156,14 +159,14 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 
 		if (choice === "暂停") return { kind: "pause" };
 		if (choice === "放弃本项目") {
-			const ok = await ctx.ui.confirm("放弃本项目", "确认终止当前项目？文件不会删除，但会进入暂停状态。");
+			const ok = await ctx.ui.confirm("放弃本项目", "确认终止当前项目？文件不会删除，但会进入暂停状态。", { signal: options.signal });
 			if (ok) return { kind: "abort" };
 			continue;
 		}
 
 		if (choice === "局部修改" || choice === "提出修改" || choice === "调整章数与节奏") {
 			if (round >= maxRounds) {
-				const again = await ctx.ui.confirm("修改轮次已用完", `已达到 ${maxRounds} 轮修改上限。仍然继续修改？`);
+				const again = await ctx.ui.confirm("修改轮次已用完", `已达到 ${maxRounds} 轮修改上限。仍然继续修改？`, { signal: options.signal });
 				if (!again) continue;
 			}
 			const prompt =
@@ -180,7 +183,7 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 
 		if (choice === "整章重写") {
 			if (round >= maxRounds) {
-				const again = await ctx.ui.confirm("修改轮次已用完", `已达到 ${maxRounds} 轮修改上限。仍然整章重写？`);
+				const again = await ctx.ui.confirm("修改轮次已用完", `已达到 ${maxRounds} 轮修改上限。仍然整章重写？`, { signal: options.signal });
 				if (!again) continue;
 			}
 			const feedback = await ctx.ui.editor("请输入整章重写要求（需要改变什么、保留什么）：", "");

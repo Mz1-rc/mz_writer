@@ -31,11 +31,13 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 		name: "writing_team",
 		label: "写作团队",
 		description:
-			"驱动多 Agent 写作团队：初始化、推进阶段、运行指定角色、确认闸门、导出。一次调用只推进一个阶段或一个角色，禁止并行调用。",
+			"驱动多 Agent 写作团队：初始化、推进阶段、运行指定角色、确认闸门、导出。耗时 action 会在后台启动并立即返回，可用 status 查看进度；一次只允许一个后台任务。",
 		promptSnippet: "驱动多 Agent 写作团队按阶段写作、确认和导出",
 		promptGuidelines: [
 			"Use writing_team when the user asks to start, continue, review, or export a long-form writing project.",
 			"Call writing_team with one action at a time; never run multiple writing_team calls in parallel.",
+			"Long-running writing_team actions return immediately after starting a background job; use status to inspect progress.",
+			"After starting a background job, do not start another writing_team action in the same turn; report the job to the user and wait.",
 			"Use writing_team set_auto and run_all only when the user explicitly asks for fully automatic operation without gate confirmations.",
 			"When writing_team returns a gate or a summary, ask the user to confirm before advancing again.",
 		],
@@ -69,43 +71,43 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 						const { store } = app.create(ctx, intake.title, intake.intake);
 						store.transition("design");
 						updateStatus(ctx, store);
-						return toolResult(store);
+						return toolResult(store, app);
 					}
 					case "status": {
 						const { store } = app.ensure(ctx);
-						return toolResult(store);
+						return toolResult(store, app);
 					}
 					case "next": {
-						return withPipeline(ctx, app, (pipeline) => pipeline.next());
+						return startToolPipeline(ctx, app, "推进下一阶段", (pipeline) => pipeline.next());
 					}
 					case "step": {
-						return withPipeline(ctx, app, (pipeline) => pipeline.step());
+						return startToolPipeline(ctx, app, "运行下一步", (pipeline) => pipeline.step());
 					}
 					case "run_role": {
 						const role = params.role as RoleId | undefined;
 						if (!role || !ROLE_IDS.includes(role)) throw new Error("run_role 需要有效的 role 参数");
-						return withPipeline(ctx, app, async (pipeline) => {
-							const expected = roleForPhase(pipeline.book.phase);
-							if (expected !== role) {
-								throw new Error(
-									`当前阶段「${pipeline.book.phase}」应运行 ${expected ?? "无"}，而不是 ${role}。`,
-								);
+						const { store } = app.ensure(ctx);
+						const expected = roleForPhase(store.book.phase);
+						if (expected !== role) {
+							throw new Error(`当前阶段「${store.book.phase}」应运行 ${expected ?? "无"}，而不是 ${role}。`);
+						}
+						return startToolPipeline(ctx, app, `运行角色 ${role}`, async (pipeline) => {
+							if (roleForPhase(pipeline.book.phase) !== role) {
+								throw new Error(`当前阶段已变化，不能运行 ${role}。`);
 							}
 							await runRole(pipeline, role);
 						});
 					}
 					case "approve": {
-						return withPipeline(ctx, app, async (pipeline) => {
-							if (!gateForPhase(pipeline.book.phase)) throw new Error("当前阶段不是闸门");
-							await pipeline.approveCurrentGate(params.feedback);
-						});
+						const { store } = app.ensure(ctx);
+						if (!gateForPhase(store.book.phase)) throw new Error("当前阶段不是闸门");
+						return startToolPipeline(ctx, app, "通过闸门", (pipeline) => pipeline.approveCurrentGate(params.feedback));
 					}
 					case "revise": {
 						if (!params.feedback?.trim()) throw new Error("revise 需要 feedback 参数");
-						return withPipeline(ctx, app, async (pipeline) => {
-							if (!gateForPhase(pipeline.book.phase)) throw new Error("当前阶段不是闸门");
-							await pipeline.reviseCurrentGate(params.feedback!.trim());
-						});
+						const { store } = app.ensure(ctx);
+						if (!gateForPhase(store.book.phase)) throw new Error("当前阶段不是闸门");
+						return startToolPipeline(ctx, app, "按意见重跑", (pipeline) => pipeline.reviseCurrentGate(params.feedback!.trim()));
 					}
 					case "abort": {
 						if (app.abortCurrent()) {
@@ -129,6 +131,7 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 						});
 					}
 					case "configure": {
+						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
 						const role = params.role as RoleId | undefined;
 						if (!role || !ROLE_IDS.includes(role)) throw new Error("configure 需要有效的 role 参数");
@@ -139,35 +142,38 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 							thinkingLevel: (params.thinkingLevel as ThinkingLevel | undefined) ?? current.thinkingLevel,
 						};
 						store.save();
-						return toolResult(store);
+						return toolResult(store, app);
 					}
 					case "pause": {
+						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
 						store.pause();
 						updateStatus(ctx, store);
-						return toolResult(store);
+						return toolResult(store, app);
 					}
 					case "resume": {
+						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
 						store.resume();
 						updateStatus(ctx, store);
-						return toolResult(store);
+						return toolResult(store, app);
 					}
 					case "set_auto": {
 						const { store } = app.ensure(ctx);
 						store.book.config.defaults.fullAuto = params.auto ?? true;
 						store.save();
 						updateStatus(ctx, store);
-						return toolResult(store);
+						return toolResult(store, app);
 					}
 					case "run_all": {
+						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
 						if (!store.book.config.defaults.fullAuto) {
 							store.book.config.defaults.fullAuto = true;
 							store.save();
 							notify(ctx, "已自动开启全自动模式，开始运行剩余流程。", "warning");
 						}
-						return withPipeline(ctx, app, (pipeline) => pipeline.runAll());
+						return startToolPipeline(ctx, app, "全自动运行", (pipeline) => pipeline.runAll());
 					}
 					default:
 						throw new Error(`未知 action: ${action}`);
@@ -184,11 +190,34 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 	});
 }
 
+function startToolPipeline(
+	ctx: ExtensionToolContext,
+	app: WritingTeamApp,
+	label: string,
+	fn: (pipeline: WritingPipeline) => Promise<void>,
+) {
+	const { store, config } = app.ensure(ctx);
+	app.startJob(label, async (controller) => {
+		const pipeline = new WritingPipeline(ctx, store, config, controller, undefined, false);
+		try {
+			await fn(pipeline);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			notify(ctx, controller.signal.aborted ? "后台任务已中止。" : message, controller.signal.aborted ? "warning" : "error");
+		} finally {
+			updateStatus(ctx, store);
+		}
+	});
+	updateStatus(ctx, store);
+	return toolResult(store, app, `⏳ 后台任务已启动：${label}。可使用 status 查看进度。`);
+}
+
 async function withPipeline(
 	ctx: ExtensionToolContext,
 	app: WritingTeamApp,
 	fn: (pipeline: WritingPipeline) => Promise<void>,
 ) {
+	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store, config } = app.ensure(ctx);
 	const controller = new AbortController();
 	app.currentAbort = controller;
@@ -196,16 +225,17 @@ async function withPipeline(
 	try {
 		await fn(pipeline);
 		updateStatus(ctx, store);
-		return toolResult(store);
+		return toolResult(store, app);
 	} finally {
 		if (app.currentAbort === controller) app.currentAbort = undefined;
 	}
 }
 
-function toolResult(store: import("./state.ts").BookStore) {
+function toolResult(store: import("./state.ts").BookStore, app?: WritingTeamApp, note?: string) {
 	const book = store.book;
 	const totalTokens = book.stats.totalUsage?.total ?? (book.stats.totalUsage?.input ?? 0) + (book.stats.totalUsage?.output ?? 0);
 	const text = [
+		note ?? "",
 		`《${book.title}》`,
 		`阶段：${book.phase}`,
 		`章节：第 ${book.currentChapter}/${book.chapterCount || "?"} 章`,
@@ -214,6 +244,7 @@ function toolResult(store: import("./state.ts").BookStore) {
 		`模式：${book.config.defaults.fullAuto ? "全自动" : "人工确认"}`,
 		`闸门：设计=${book.gates.design.status}, 大纲=${book.gates.outline.status}, 终审=${book.gates.final.status}`,
 		book.lastError ? `最近错误：${book.lastError.message}` : "",
+		app?.currentJob ? `后台任务：${app.currentJob.label}（${Math.max(0, Math.round((Date.now() - app.currentJob.startedAt) / 1000))}s）` : "",
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -232,6 +263,13 @@ function toolResult(store: import("./state.ts").BookStore) {
 			gates: book.gates,
 			root: store.root,
 			lastError: book.lastError,
+			job: app?.currentJob
+				? {
+						label: app.currentJob.label,
+						startedAt: app.currentJob.startedAt,
+						done: app.currentJob.done,
+					}
+				: undefined,
 		},
 	};
 }

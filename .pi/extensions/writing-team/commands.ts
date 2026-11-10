@@ -57,20 +57,20 @@ export async function handleBookCommand(args: string, ctx: ExtensionCommandConte
 				showStatus(ctx, app);
 				return;
 			case "next":
-				await withPipeline(ctx, app, (pipeline) => pipeline.next());
+				startPipeline(ctx, app, "推进下一阶段", (pipeline) => pipeline.next());
 				return;
 			case "step":
-				await withPipeline(ctx, app, (pipeline) => pipeline.step());
+				startPipeline(ctx, app, "运行下一步", (pipeline) => pipeline.step());
 				return;
 			case "run":
-				await withPipeline(ctx, app, (pipeline) => runSpecificRole(pipeline, rest));
+				startPipeline(ctx, app, `运行角色 ${rest || "(当前阶段)"}`, (pipeline) => runSpecificRole(pipeline, rest));
 				return;
 			case "approve":
-				await withPipeline(ctx, app, (pipeline) => pipeline.approveCurrentGate(rest || undefined));
+				startPipeline(ctx, app, "通过闸门", (pipeline) => pipeline.approveCurrentGate(rest || undefined));
 				return;
 			case "revise":
 				if (!rest) throw new Error("用法：/book revise <修改意见>");
-				await withPipeline(ctx, app, (pipeline) => pipeline.reviseCurrentGate(rest));
+				startPipeline(ctx, app, "按意见重跑", (pipeline) => pipeline.reviseCurrentGate(rest));
 				return;
 			case "chapter":
 				await withPipeline(ctx, app, async (pipeline) => {
@@ -131,11 +131,37 @@ export async function handleBookCommand(args: string, ctx: ExtensionCommandConte
 	}
 }
 
+function startPipeline(
+	ctx: ExtensionCommandContext,
+	app: WritingTeamApp,
+	label: string,
+	fn: (pipeline: WritingPipeline) => Promise<void>,
+): void {
+	const { store, config } = app.ensure(ctx);
+	app.startJob(label, async (controller) => {
+		const pipeline = new WritingPipeline(ctx, store, config, controller, undefined, false);
+		try {
+			await fn(pipeline);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (controller.signal.aborted) {
+				notify(ctx, "后台任务已中止。", "warning");
+			} else {
+				notify(ctx, message, "error");
+			}
+		} finally {
+			updateStatus(ctx, store);
+		}
+	});
+	notify(ctx, `⏳ 已启动后台任务：${label}。使用 /book status 查看进度。`, "info");
+}
+
 async function withPipeline(
 	ctx: ExtensionCommandContext,
 	app: WritingTeamApp,
 	fn: (pipeline: WritingPipeline) => Promise<void>,
 ): Promise<void> {
+	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store, config } = app.ensure(ctx);
 	const controller = new AbortController();
 	app.currentAbort = controller;
@@ -228,6 +254,7 @@ function showStatus(ctx: ExtensionCommandContext, app: WritingTeamApp): void {
 		`字数：${book.stats.words.toLocaleString()}（已完成 ${book.stats.chaptersCompleted} 章）`,
 		`闸门：设计 ${gateText(book.gates.design)} / 大纲 ${gateText(book.gates.outline)} / 终审 ${gateText(book.gates.final)}`,
 		currentRun ? `运行中：${roleLabel(currentRun.role)}（${currentRun.startedAt}）` : "运行中：无",
+		app.currentJob ? `后台任务：${app.currentJob.label}（已运行 ${Math.max(0, Math.round((Date.now() - app.currentJob.startedAt) / 1000))}s）` : "",
 		book.lastError ? `最近错误：${book.lastError.message}` : "",
 		`目录：${store.root}`,
 		`模式：${book.config.defaults.fullAuto ? "⚡ 全自动（闸门自动通过）" : "人工确认"}`,
@@ -312,6 +339,7 @@ function roleForCurrentPhase(pipeline: WritingPipeline): RoleId | undefined {
 }
 
 async function rewind(ctx: ExtensionCommandContext, app: WritingTeamApp, arg: string): Promise<void> {
+	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store, config } = app.ensure(ctx);
 	const target = arg.trim();
 	const allowed = ["design", "outline", "chapter_plan", "final_review"] as const;
@@ -333,6 +361,7 @@ async function rewind(ctx: ExtensionCommandContext, app: WritingTeamApp, arg: st
 }
 
 async function configureRoleModel(ctx: ExtensionCommandContext, app: WritingTeamApp): Promise<void> {
+	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store, config } = app.ensure(ctx);
 	const roleLabels = ROLE_IDS.map((role) => `${roleLabel(role)}（${role}）`);
 	const roleChoice = await ctx.ui.select("为哪个角色配置模型？", roleLabels);
@@ -389,6 +418,7 @@ function doctor(ctx: ExtensionCommandContext, app: WritingTeamApp): void {
 }
 
 function openBook(ctx: ExtensionCommandContext, app: WritingTeamApp, slug: string): void {
+	if (slug && app.isBusy()) throw new Error(app.busyMessage());
 	const list = app.list(ctx);
 	if (!slug) {
 		notify(ctx, list.length ? `可用项目：\n${list.map((b) => `${b.slug} — ${b.title}`).join("\n")}` : "没有书籍项目。", "info");
@@ -403,7 +433,7 @@ function showHelp(ctx: ExtensionCommandContext): void {
 	const text = [
 		"/book init [书名]     创建书籍并进入需求访谈",
 		"/book status          查看状态",
-		"/book next            推进下一阶段",
+		"/book next            后台推进下一阶段（可用 status 查看）",
 		"/book step            只运行下一个角色/闸门",
 		"/book run <role>      运行当前阶段对应的角色",
 		"/book approve         通过当前闸门并继续",
@@ -447,13 +477,14 @@ async function setAutoMode(ctx: ExtensionCommandContext, app: WritingTeamApp, ar
 }
 
 async function runAll(ctx: ExtensionCommandContext, app: WritingTeamApp): Promise<void> {
+	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store } = app.ensure(ctx);
 	if (!store.book.config.defaults.fullAuto) {
 		store.book.config.defaults.fullAuto = true;
 		store.save();
 		notify(ctx, "⚡ 已自动开启全自动模式并开始运行。", "warning");
 	}
-	await withPipeline(ctx, app, (pipeline) => pipeline.runAll());
+	startPipeline(ctx, app, "全自动运行", (pipeline) => pipeline.runAll());
 }
 
 function splitList(text: string): string[] {

@@ -42,17 +42,17 @@ pi -e ./.pi/extensions/writing-team/index.ts
 |---|---|
 | `/book init [书名]` | 创建书籍并进入需求访谈 |
 | `/book status` | 查看阶段、章节、字数、闸门、模型 |
-| `/book next` | 推进下一阶段（章节阶段按配置自动串行） |
-| `/book step` | 只运行下一个角色或闸门 |
-| `/book run <role>` | 运行当前阶段对应的角色 |
-| `/book approve` | 通过当前闸门并继续 |
-| `/book revise <意见>` | 带修改意见重跑当前闸门产物 |
+| `/book next` | 后台推进下一阶段（立即返回，可 `/book status` 查看） |
+| `/book step` | 后台运行下一个角色或闸门 |
+| `/book run <role>` | 后台运行当前阶段对应的角色 |
+| `/book approve` | 后台通过当前闸门并继续 |
+| `/book revise <意见>` | 后台带修改意见重跑当前闸门产物 |
 | `/book chapter <n>` | 切换当前章节 |
 | `/book rewind <阶段>` | 回滚到 `design` / `outline` / `chapter_plan` / `final_review` |
 | `/book models` | 为角色选择模型和 thinking level |
 | `/book config` | 查看配置 |
 | `/book auto on\|off` | 开启/关闭全自动模式（闸门自动通过） |
-| `/book auto-run` | 全自动跑完剩余流程 |
+| `/book auto-run` | 后台全自动跑完剩余流程 |
 | `/book pause` / `/book resume` | 暂停 / 恢复 |
 | `/book abort` | 请求中止当前角色运行（也可按 Esc） |
 | `/book export` | 导出 Markdown 成稿 |
@@ -69,6 +69,16 @@ pi -e ./.pi/extensions/writing-team/index.ts
 - 全自动模式仍然执行角色输出校验、字数校验、JSON 校验和归档检查，不会跳过质量底线。
 
 主 Agent 还可以调用 `writing_team` 工具，用自然语言驱动同一套流程。工具设置了 `executionMode: "sequential"`，并明确要求一次只推进一个阶段。全自动相关 action：`set_auto`、`run_all`。
+
+耗时操作（`next`、`step`、`run_role`、`approve`、`revise`、`run_all`）会在后台启动，命令/工具立即返回。运行期间可以继续使用：
+
+```text
+/book status     # 查看当前角色、实时上下文、操作详情、Token
+/book doctor     # 文件与状态体检
+/book abort      # 请求中止当前后台任务
+```
+
+同一时间仍然只允许一个后台任务；重复推进会被拒绝并提示当前任务信息。`pause` / `resume` / `chapter` / `models` 等会修改状态或配置的命令在后台任务运行期间会被拒绝。
 
 ## 角色
 

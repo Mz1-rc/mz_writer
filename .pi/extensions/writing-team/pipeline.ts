@@ -46,6 +46,7 @@ export class WritingPipeline {
 	readonly config: TeamConfig;
 	readonly abortController?: AbortController;
 	private readonly roleRunner?: RoleRunner;
+	private readonly useContextSignal: boolean;
 
 	constructor(
 		ctx: ExtensionContext,
@@ -53,12 +54,14 @@ export class WritingPipeline {
 		config: TeamConfig,
 		abortController?: AbortController,
 		roleRunner?: RoleRunner,
+		useContextSignal = true,
 	) {
 		this.ctx = ctx;
 		this.store = store;
 		this.config = config;
 		this.abortController = abortController;
 		this.roleRunner = roleRunner;
+		this.useContextSignal = useContextSignal;
 	}
 
 	get book(): BookProject {
@@ -273,6 +276,7 @@ export class WritingPipeline {
 					(readText(join(this.store.root, "design.md")) ?? "").trim().length > 0 &&
 					(readText(join(this.store.root, "style-guide.md")) ?? "").trim().length > 0,
 				validationOk: attempt.validation.ok,
+				signal: this.abortController?.signal,
 			});
 			if (decision.kind === "approve") {
 				this.store.recordGate("design", "approved", { runId: attempt.runId });
@@ -314,6 +318,7 @@ export class WritingPipeline {
 				maxRevisionRounds: this.config.defaults.maxRevisionRounds,
 				allowApprove: Boolean(manifestBeforeGate) && (readText(join(this.store.root, "outline.md")) ?? "").trim().length > 0,
 				validationOk: attempt.validation.ok,
+				signal: this.abortController?.signal,
 			});
 			if (decision.kind === "approve") {
 				const manifest = readOutlineManifest(this.store.root);
@@ -473,6 +478,7 @@ export class WritingPipeline {
 				summary: summaryLines.filter(Boolean).join("\n"),
 				revisionRound: round,
 				maxRevisionRounds: this.config.defaults.maxRevisionRounds,
+				signal: this.abortController?.signal,
 			});
 
 			if (decision.kind === "approve") {
@@ -546,6 +552,7 @@ export class WritingPipeline {
 				revisionRound: round,
 				maxRevisionRounds: this.config.defaults.maxRevisionRounds,
 				validationOk: attempt.validation.ok,
+				signal: this.abortController?.signal,
 			});
 			if (decision.kind === "approve") {
 				this.store.recordGate("final", "approved", { runId: attempt.runId });
@@ -846,7 +853,11 @@ export class WritingPipeline {
 					status: aborted ? "aborted" : "error",
 					error: message,
 				});
-				if (!aborted) this.store.markError(message, run.id);
+				if (aborted) {
+					this.store.pause();
+				} else {
+					this.store.markError(message, run.id);
+				}
 			}
 			throw error;
 		} finally {
@@ -1011,7 +1022,9 @@ export class WritingPipeline {
 	}
 
 	private effectiveSignal(): AbortSignal | undefined {
-		const signals = [this.ctx.signal, this.abortController?.signal].filter(Boolean) as AbortSignal[];
+		const signals = [this.useContextSignal ? this.ctx.signal : undefined, this.abortController?.signal].filter(
+			Boolean,
+		) as AbortSignal[];
 		if (signals.length === 0) return undefined;
 		if (signals.length === 1) return signals[0];
 		try {
