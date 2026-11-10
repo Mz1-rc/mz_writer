@@ -150,6 +150,15 @@ export class WritingPipeline {
 		}
 	}
 
+	/** External "advance" action: in full-auto mode run the rest of the book. */
+	async runNextAction(): Promise<void> {
+		if (this.book.config.defaults.fullAuto) {
+			await this.runAll();
+			return;
+		}
+		await this.next();
+	}
+
 	/** Run exactly one role (or one gate) and stop. */
 	async step(): Promise<void> {
 		const phase = this.book.phase;

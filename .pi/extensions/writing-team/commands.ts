@@ -57,7 +57,7 @@ export async function handleBookCommand(args: string, ctx: ExtensionCommandConte
 				showStatus(ctx, app);
 				return;
 			case "next":
-				startPipeline(ctx, app, "推进下一阶段", (pipeline) => pipeline.next());
+				startPipeline(ctx, app, "推进下一阶段", (pipeline) => pipeline.runNextAction());
 				return;
 			case "step":
 				startPipeline(ctx, app, "运行下一步", (pipeline) => pipeline.step());
@@ -66,11 +66,17 @@ export async function handleBookCommand(args: string, ctx: ExtensionCommandConte
 				startPipeline(ctx, app, `运行角色 ${rest || "(当前阶段)"}`, (pipeline) => runSpecificRole(pipeline, rest));
 				return;
 			case "approve":
-				startPipeline(ctx, app, "通过闸门", (pipeline) => pipeline.approveCurrentGate(rest || undefined));
+				startPipeline(ctx, app, "通过闸门", async (pipeline) => {
+					await pipeline.approveCurrentGate(rest || undefined);
+					if (pipeline.book.config.defaults.fullAuto) await pipeline.runAll();
+				});
 				return;
 			case "revise":
 				if (!rest) throw new Error("用法：/book revise <修改意见>");
-				startPipeline(ctx, app, "按意见重跑", (pipeline) => pipeline.reviseCurrentGate(rest));
+				startPipeline(ctx, app, "按意见重跑", async (pipeline) => {
+					await pipeline.reviseCurrentGate(rest);
+					if (pipeline.book.config.defaults.fullAuto) await pipeline.runAll();
+				});
 				return;
 			case "chapter":
 				await withPipeline(ctx, app, async (pipeline) => {

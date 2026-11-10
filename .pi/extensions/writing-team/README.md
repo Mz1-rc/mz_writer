@@ -63,6 +63,7 @@ pi -e ./.pi/extensions/writing-team/index.ts
 全自动模式：
 
 - `/book auto on` 后，所有闸门自动通过，产出校验失败时自动暂停；
+- 全自动模式下 `/book next` 会直接跑到完成，不再逐章停下；需要单步执行时用 `/book step`；
 - `/book auto-run` 会开启全自动并直接跑完剩余流程；
 - 最终审稿为 `VERDICT: REVISE` 时，全自动模式会带问题交付并给出警告；
 - 所有确认闸门都不展示全文，只列出 `design.md`、`outline.md`、`final.md`、`reviews/final-review.md` 等文件路径，方便你自行打开确认；

@@ -78,7 +78,7 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 						return toolResult(store, app);
 					}
 					case "next": {
-						return startToolPipeline(ctx, app, "推进下一阶段", (pipeline) => pipeline.next());
+						return startToolPipeline(ctx, app, "推进下一阶段", (pipeline) => pipeline.runNextAction());
 					}
 					case "step": {
 						return startToolPipeline(ctx, app, "运行下一步", (pipeline) => pipeline.step());
@@ -101,13 +101,19 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 					case "approve": {
 						const { store } = app.ensure(ctx);
 						if (!gateForPhase(store.book.phase)) throw new Error("当前阶段不是闸门");
-						return startToolPipeline(ctx, app, "通过闸门", (pipeline) => pipeline.approveCurrentGate(params.feedback));
+						return startToolPipeline(ctx, app, "通过闸门", async (pipeline) => {
+							await pipeline.approveCurrentGate(params.feedback);
+							if (pipeline.book.config.defaults.fullAuto) await pipeline.runAll();
+						});
 					}
 					case "revise": {
 						if (!params.feedback?.trim()) throw new Error("revise 需要 feedback 参数");
 						const { store } = app.ensure(ctx);
 						if (!gateForPhase(store.book.phase)) throw new Error("当前阶段不是闸门");
-						return startToolPipeline(ctx, app, "按意见重跑", (pipeline) => pipeline.reviseCurrentGate(params.feedback!.trim()));
+						return startToolPipeline(ctx, app, "按意见重跑", async (pipeline) => {
+							await pipeline.reviseCurrentGate(params.feedback!.trim());
+							if (pipeline.book.config.defaults.fullAuto) await pipeline.runAll();
+						});
 					}
 					case "abort": {
 						if (app.abortCurrent()) {

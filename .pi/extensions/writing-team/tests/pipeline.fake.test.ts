@@ -201,7 +201,7 @@ test("full-auto mode completes without any gate UI", async () => {
 		};
 
 		const pipeline = new WritingPipeline(ctx as any, store, config, undefined, fakeRunner);
-		await pipeline.runAll();
+		await pipeline.runNextAction();
 
 		assert.equal(store.book.phase, "done");
 		assert.equal(selectCalls, 0);

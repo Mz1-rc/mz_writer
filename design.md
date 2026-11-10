@@ -947,3 +947,4 @@ Widget（编辑器上方）：
 - **全自动模式**：新增 `defaults.fullAuto`、`/book auto on|off`、`/book auto-run`，以及 `writing_team` 的 `set_auto` / `run_all`。全自动模式跳过人工闸门，但仍执行产出校验；校验失败会暂停，而不是强行通过。终审为 `VERDICT: REVISE` 时带问题交付并警告。
 - **确认闸门不展示全文**：G1/G2/G3/G4 都不展示工件全文，只显示摘要、字数和文件路径（如 `design.md`、`outline.md`、`final.md`、`reviews/final-review.md`），由用户自行打开确认。
 - **后台运行**：角色运行放在后台任务中，命令/工具立即返回；运行期间可执行 `/book status`、`/book doctor`、`/book abort` 等只读或中止命令。同一时间仍只允许一个后台任务。
+- **全自动连续写作**：全自动模式下 `/book next` 直接跑到完成，不再逐章等待 `/book next`；`/book step` 仍保留单步执行。
