@@ -27,7 +27,7 @@ export default function writingTeamExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		app.abortCurrent();
+		app.shutdown();
 		clearStatus(ctx);
 	});
 }

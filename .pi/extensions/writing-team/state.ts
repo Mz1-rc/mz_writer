@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { chapterKey, countChars, ensureDir, fileStat, isStale, nowIso, readJson, slugify, timestampForId, writeJsonAtomic } from "./paths.ts";
-import { DEFAULT_CONFIG, deepMerge } from "./config.ts";
+import { DEFAULT_CONFIG, diffConfig, mergeBookConfig } from "./config.ts";
 import type {
 	BookProject,
 	GateId,
@@ -13,6 +13,7 @@ import type {
 	RunRecord,
 	RunUsage,
 	TeamConfig,
+	DeepPartial,
 } from "./types.ts";
 
 const ALLOWED_TRANSITIONS: Record<Phase, Phase[]> = {
@@ -67,7 +68,7 @@ export function listBooks(workspace: string, config: TeamConfig): BookSummary[] 
 		if (!entry.isDirectory()) continue;
 		const path = join(root, entry.name, "book.json");
 		const book = readJson<BookProject>(path);
-		if (!book || book.schemaVersion !== 1) continue;
+		if (!book || (book.schemaVersion !== 1 && book.schemaVersion !== 2)) continue;
 		out.push({ slug: book.slug, title: book.title, phase: book.phase, updatedAt: book.updatedAt, path });
 	}
 	return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -90,7 +91,7 @@ export function createBook(
 	ensureDir(bookRoot);
 	const now = nowIso();
 	const book: BookProject = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		slug,
 		title: title.trim() || "未命名作品",
 		language: config.language,
@@ -99,8 +100,11 @@ export function createBook(
 		phase: "intake",
 		currentChapter: 1,
 		chapterCount: 0,
+		continuityThrough: 0,
 		intake,
-		config,
+		// Keep the effective config separate from the base config reference so
+		// save() can persist only real book-level overrides.
+		config: structuredClone(config),
 		gates: {
 			design: emptyGate(),
 			outline: emptyGate(),
@@ -114,7 +118,7 @@ export function createBook(
 		},
 		runs: [],
 	};
-	const store = new BookStore(bookRoot, book);
+	const store = new BookStore(bookRoot, book, config);
 	store.save();
 	return store;
 }
@@ -122,11 +126,16 @@ export function createBook(
 export class BookStore {
 	readonly root: string;
 	book: BookProject;
-	private lockHeld = false;
+	/** Effective base config (defaults + global + project) used to persist only book overrides. */
+	readonly baseConfig: TeamConfig;
+	private lockDepth = 0;
+	private lockHeartbeat?: ReturnType<typeof setInterval>;
+	private lockForced = false;
 
-	constructor(root: string, book: BookProject) {
+	constructor(root: string, book: BookProject, baseConfig: TeamConfig = DEFAULT_CONFIG) {
 		this.root = root;
 		this.book = book;
+		this.baseConfig = baseConfig;
 	}
 
 	static load(workspace: string, config: TeamConfig, slug?: string): BookStore {
@@ -137,18 +146,22 @@ export class BookStore {
 		else chosen = summaries[0];
 		if (!chosen) throw new Error(`找不到书籍项目: ${slug}`);
 		const book = readJson<BookProject>(join(chosen.path));
-		if (!book || book.schemaVersion !== 1) throw new Error(`书籍状态文件损坏: ${chosen.path}`);
-		normalizeBookConfig(book);
-		const store = new BookStore(join(booksRoot(workspace, config), chosen.slug), book);
+		if (!book || (book.schemaVersion !== 1 && book.schemaVersion !== 2)) {
+			throw new Error(`书籍状态文件损坏: ${chosen.path}`);
+		}
+		hydrateBookConfig(book, config);
+		const store = new BookStore(join(booksRoot(workspace, config), chosen.slug), book, config);
 		store.markInterruptedRuns();
 		return store;
 	}
 
-	static loadByPath(root: string): BookStore {
+	static loadByPath(root: string, baseConfig: TeamConfig = DEFAULT_CONFIG): BookStore {
 		const book = readJson<BookProject>(join(root, "book.json"));
-		if (!book || book.schemaVersion !== 1) throw new Error(`书籍状态文件损坏: ${root}`);
-		normalizeBookConfig(book);
-		const store = new BookStore(root, book);
+		if (!book || (book.schemaVersion !== 1 && book.schemaVersion !== 2)) {
+			throw new Error(`书籍状态文件损坏: ${root}`);
+		}
+		hydrateBookConfig(book, baseConfig);
+		const store = new BookStore(root, book, baseConfig);
 		store.markInterruptedRuns();
 		return store;
 	}
@@ -167,7 +180,11 @@ export class BookStore {
 
 	save(): void {
 		this.book.updatedAt = nowIso();
-		writeJsonAtomic(this.bookPath, this.book);
+		// Persist only the delta from the effective base config so later
+		// global/project config changes are not shadowed by a stale snapshot.
+		const overrides = (diffConfig(this.baseConfig, this.book.config) ?? {}) as DeepPartial<TeamConfig>;
+		const persisted = { ...this.book, schemaVersion: 2 as const, config: overrides } as unknown as BookProject;
+		writeJsonAtomic(this.bookPath, persisted);
 	}
 
 	transition(next: Phase): void {
@@ -175,7 +192,9 @@ export class BookStore {
 		if (next === current) return;
 		if (next === "paused") {
 			if (current === "paused") return;
-			this.book.previousPhase = current;
+			// Pausing from error must preserve the pre-error phase so resume can
+			// return to a runnable stage.
+			if (current !== "error") this.book.previousPhase = current;
 			this.book.phase = "paused";
 			this.save();
 			return;
@@ -276,22 +295,39 @@ export class BookStore {
 
 	finishRun(
 		id: string,
-		patch: Partial<Pick<RunRecord, "status" | "outputFiles" | "usage" | "error" | "model" | "thinkingLevel" | "validation">> & {
-			revisionOf?: string;
-		},
+		patch: Partial<Omit<RunRecord, "id" | "role" | "phase" | "startedAt">> & { revisionOf?: string },
 	): void {
 		const run = this.book.runs.find((item) => item.id === id);
 		if (!run) return;
+		const wasRunning = run.status === "running";
 		Object.assign(run, patch);
 		run.endedAt = nowIso();
-		if (run.usage) {
+		if (run.usage && wasRunning) {
 			const usage = this.book.stats.totalUsage;
 			usage.total = (usage.total ?? usage.input + usage.output) + (run.usage.total ?? run.usage.input + run.usage.output);
 			usage.input += run.usage.input;
 			usage.output += run.usage.output;
 			usage.cost = (usage.cost ?? 0) + (run.usage.cost ?? 0);
 		}
+		if (run.status === "success") this.book.lastError = undefined;
+		if (wasRunning) this.appendRunIndex(run);
+		this.pruneRuns();
 		this.save();
+	}
+
+	private appendRunIndex(run: RunRecord): void {
+		try {
+			ensureDir(join(this.root, ".runs"));
+			appendFileSync(join(this.root, ".runs", "index.jsonl"), `${JSON.stringify(run)}\n`, "utf8");
+		} catch {
+			// The run index is diagnostic only; never fail a run because of it.
+		}
+	}
+
+	private pruneRuns(): void {
+		const keep = Math.max(1, this.book.config.defaults.keepRuns ?? 200);
+		if (this.book.runs.length <= keep) return;
+		this.book.runs.splice(0, this.book.runs.length - keep);
 	}
 
 	getRun(id: string): RunRecord | undefined {
@@ -315,12 +351,17 @@ export class BookStore {
 		return this.book.gates[gate];
 	}
 
-	recordGate(gate: GateId, status: GateRecord["status"], options: { chapter?: number; feedback?: string; runId?: string } = {}): void {
+	recordGate(
+		gate: GateId,
+		status: GateRecord["status"],
+		options: { chapter?: number; feedback?: string; runId?: string; artifactHash?: string } = {},
+	): void {
 		const record = this.gate(gate, options.chapter);
 		record.status = status;
 		record.decidedAt = nowIso();
 		record.feedback = options.feedback;
 		record.artifactVersion = options.runId;
+		record.artifactHash = status === "approved" ? options.artifactHash : undefined;
 		this.save();
 	}
 
@@ -333,7 +374,7 @@ export class BookStore {
 	chapterTargetWords(n: number): number {
 		const manifest = this.outline();
 		const chapters = Array.isArray(manifest?.chapters) ? manifest.chapters : [];
-		return chapters.find((ch) => ch.n === n)?.targetWords ?? this.book.config.defaults.chapterWords;
+		return chapters.find((ch) => ch.n === n)?.targetWords ?? this.book.intake.chapterWords ?? this.book.config.defaults.chapterWords;
 	}
 
 	outline(): OutlineManifest | undefined {
@@ -358,8 +399,14 @@ export class BookStore {
 		this.save();
 	}
 
-	acquireLock(role: RoleId): void {
-		if (this.lockHeld) return;
+	acquireLock(label: string): void {
+		// Re-entrant: a pipeline job holds the lock for its whole lifetime while
+		// individual role runs acquire/release nested references.
+		if (this.lockDepth > 0) {
+			this.lockDepth++;
+			return;
+		}
+		this.lockForced = false;
 		const path = join(this.root, ".lock");
 		if (existsSync(path)) {
 			const info = readJson<{ pid?: number; startedAt?: string; role?: string }>(path);
@@ -377,18 +424,56 @@ export class BookStore {
 				// ignore
 			}
 		}
-		writeFileSync(path, JSON.stringify({ pid: process.pid, role, startedAt: nowIso() }, null, 2), { encoding: "utf8", flag: "wx" });
-		this.lockHeld = true;
+		writeFileSync(path, JSON.stringify({ pid: process.pid, role: label, startedAt: nowIso() }, null, 2), {
+			encoding: "utf8",
+			flag: "wx",
+		});
+		this.lockDepth = 1;
+		this.startLockHeartbeat();
 	}
 
 	releaseLock(): void {
-		if (!this.lockHeld) return;
+		if (this.lockForced || this.lockDepth === 0) return;
+		this.lockDepth--;
+		if (this.lockDepth > 0) return;
+		this.stopLockHeartbeat();
 		try {
 			unlinkSync(join(this.root, ".lock"));
 		} catch {
 			// ignore
 		}
-		this.lockHeld = false;
+	}
+
+	/** Used on shutdown when the async run may not get a chance to release. */
+	forceReleaseLock(): void {
+		this.lockForced = true;
+		this.lockDepth = 0;
+		this.stopLockHeartbeat();
+		try {
+			unlinkSync(join(this.root, ".lock"));
+		} catch {
+			// ignore
+		}
+	}
+
+	private startLockHeartbeat(): void {
+		if (this.lockHeartbeat) return;
+		const path = join(this.root, ".lock");
+		this.lockHeartbeat = setInterval(() => {
+			try {
+				const now = new Date();
+				utimesSync(path, now, now);
+			} catch {
+				// ignore
+			}
+		}, 30_000);
+		this.lockHeartbeat.unref?.();
+	}
+
+	private stopLockHeartbeat(): void {
+		if (!this.lockHeartbeat) return;
+		clearInterval(this.lockHeartbeat);
+		this.lockHeartbeat = undefined;
 	}
 
 	hasLock(): boolean {
@@ -405,12 +490,24 @@ export class BookStore {
 	}
 }
 
-function normalizeBookConfig(book: BookProject): void {
-	if (!book.config || typeof book.config !== "object") {
-		book.config = structuredClone(DEFAULT_CONFIG);
-		return;
+function hydrateBookConfig(book: BookProject, baseConfig: TeamConfig): void {
+	const raw = (book.config ?? {}) as unknown;
+	const overrides = (diffConfig(baseConfig, raw) ?? {}) as DeepPartial<TeamConfig>;
+	book.config = mergeBookConfig(baseConfig, overrides);
+	book.continuityThrough = Number.isInteger(book.continuityThrough)
+		? Math.max(0, book.continuityThrough)
+		: deriveContinuityThrough(book);
+	book.schemaVersion = 2;
+}
+
+function deriveContinuityThrough(book: BookProject): number {
+	let max = 0;
+	for (const [key, gate] of Object.entries(book.gates?.chapters ?? {})) {
+		if (gate?.status !== "approved") continue;
+		const n = Number(key.replace(/^ch/, ""));
+		if (Number.isInteger(n)) max = Math.max(max, n);
 	}
-	book.config = deepMerge(DEFAULT_CONFIG, book.config);
+	return max;
 }
 
 function isProcessAlive(pid: number): boolean {

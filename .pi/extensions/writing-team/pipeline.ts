@@ -3,11 +3,17 @@ import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	hasBlockingContinuityIssues,
+	promoteRunArtifacts,
+	readContinuityReport,
+	readFinalReview,
 	readOutlineManifest,
 	validateRoleOutputs,
 } from "./artifacts.ts";
+import { archiveBookPaths, restoreContinuityTo as restoreCanon } from "./canon.ts";
 import { effectiveThinkingLevel, isBetaReaderEnabled, isWorldbuilderEnabled, resolveModel, roleConfig } from "./config.ts";
-import { gateForPhase, roleLabel, roleOutputTargets, rolePhase } from "./roles.ts";
+import { computeGateHash } from "./gate-hash.ts";
+import { roleInputs } from "./role-specs.ts";
+import { gateForPhase, roleLabel, roleMeta, roleOutputTargets, rolePhase } from "./roles.ts";
 import { buildSystemPrompt, buildTaskPrompt } from "./prompts.ts";
 import {
 	chapterKey,
@@ -16,6 +22,7 @@ import {
 	fileExists,
 	nowIso,
 	readText,
+	sha256,
 	writeAtomic,
 	writeJsonAtomic,
 } from "./paths.ts";
@@ -76,7 +83,7 @@ export class WritingPipeline {
 				await this.runDesign();
 				return;
 			case "design_gate":
-				if (this.config.defaults.fullAuto) {
+				if (this.book.config.defaults.fullAuto) {
 					await this.approveCurrentGate();
 					return;
 				}
@@ -89,14 +96,14 @@ export class WritingPipeline {
 				await this.runOutline();
 				return;
 			case "outline_gate":
-				if (this.config.defaults.fullAuto) {
+				if (this.book.config.defaults.fullAuto) {
 					await this.approveCurrentGate();
 					return;
 				}
 				notify(this.ctx, "当前在「大纲确认」闸门。请使用 /book approve 或 /book revise <意见>。", "info");
 				return;
 			case "chapter_plan":
-				if (this.config.defaults.autoRunChapterPipeline) await this.runChapterPipeline();
+				if (this.book.config.defaults.autoRunChapterPipeline) await this.runChapterPipeline();
 				else await this.runChapterStep();
 				return;
 			case "draft":
@@ -114,7 +121,7 @@ export class WritingPipeline {
 				await this.runFinalReview();
 				return;
 			case "final_gate":
-				if (this.config.defaults.fullAuto) {
+				if (this.book.config.defaults.fullAuto) {
 					await this.approveCurrentGate();
 					return;
 				}
@@ -193,7 +200,7 @@ export class WritingPipeline {
 			case "design_gate":
 			case "outline_gate":
 			case "final_gate":
-				if (this.config.defaults.fullAuto) {
+				if (this.book.config.defaults.fullAuto) {
 					await this.approveCurrentGate();
 					return;
 				}
@@ -280,16 +287,20 @@ export class WritingPipeline {
 				gate: "design",
 				summary: this.gateSummaryFor("design", attempt),
 				revisionRound: round,
-				maxRevisionRounds: this.config.defaults.maxRevisionRounds,
+				maxRevisionRounds: this.book.config.defaults.maxRevisionRounds,
 				allowApprove:
+					attempt.validation.ok &&
 					(readText(join(this.store.root, "design.md")) ?? "").trim().length > 0 &&
 					(readText(join(this.store.root, "style-guide.md")) ?? "").trim().length > 0,
 				validationOk: attempt.validation.ok,
 				signal: this.abortController?.signal,
 			});
 			if (decision.kind === "approve") {
-				this.store.recordGate("design", "approved", { runId: attempt.runId });
-				const next = isWorldbuilderEnabled(this.config, this.book.intake.genre) ? "bible" : "outline";
+				this.store.recordGate("design", "approved", {
+					runId: attempt.runId,
+					artifactHash: computeGateHash(this.store.root, "design"),
+				});
+				const next = isWorldbuilderEnabled(this.book.config, this.book.intake.genre) ? "bible" : "outline";
 				this.store.transition(next);
 				notify(this.ctx, "设计已确认。", "info");
 				return;
@@ -324,8 +335,11 @@ export class WritingPipeline {
 				gate: "outline",
 				summary: this.gateSummaryFor("outline", attempt),
 				revisionRound: round,
-				maxRevisionRounds: this.config.defaults.maxRevisionRounds,
-				allowApprove: Boolean(manifestBeforeGate) && (readText(join(this.store.root, "outline.md")) ?? "").trim().length > 0,
+				maxRevisionRounds: this.book.config.defaults.maxRevisionRounds,
+				allowApprove:
+					attempt.validation.ok &&
+					Boolean(manifestBeforeGate) &&
+					(readText(join(this.store.root, "outline.md")) ?? "").trim().length > 0,
 				validationOk: attempt.validation.ok,
 				signal: this.abortController?.signal,
 			});
@@ -335,14 +349,11 @@ export class WritingPipeline {
 					notify(this.ctx, "大纲 JSON 无法解析，不能通过。已停留在「大纲确认」闸门，请使用 /book revise 让大纲师重新输出。", "error");
 					return;
 				}
-				this.store.recordGate("outline", "approved", { runId: attempt.runId });
-				this.book.chapterCount = manifest.chapterCount;
-				this.book.currentChapter = 1;
-				for (const chapter of manifest.chapters) {
-					const key = chapterKey(chapter.n);
-					this.book.gates.chapters[key] ??= { status: "pending" };
-				}
-				this.store.save();
+				this.store.recordGate("outline", "approved", {
+					runId: attempt.runId,
+					artifactHash: computeGateHash(this.store.root, "outline"),
+				});
+				this.applyOutlineManifest(manifest);
 				this.store.transition("chapter_plan");
 				notify(this.ctx, `大纲已确认：${manifest.chapterCount} 章。`, "info");
 				return;
@@ -365,15 +376,15 @@ export class WritingPipeline {
 	// Chapter loop
 	// ---------------------------------------------------------------------
 
-	async runChapterPipeline(reworkForFinal = false): Promise<void> {
+	async runChapterPipeline(): Promise<void> {
 		this.ensureChapterContext();
 		await this.runChapterPlanner();
 		await this.runWriter();
 		await this.runContinuity();
 		if (this.book.phase === "revision") await this.runReviser();
 		await this.runLineEditor();
-		if (isBetaReaderEnabled(this.config)) await this.runBetaReader();
-		await this.runChapterGate(reworkForFinal);
+		if (isBetaReaderEnabled(this.book.config)) await this.runBetaReader();
+		await this.runChapterGate();
 	}
 
 	async runChapterStep(): Promise<void> {
@@ -425,8 +436,12 @@ export class WritingPipeline {
 		this.ensureChapterContext();
 		const chapter = this.book.currentChapter;
 		this.assertValid(await this.runRoleWithRetry("continuity_editor", { chapter }), "continuity_editor");
-		const report = readText(join(this.store.root, "chapters", chapterKey(chapter), "continuity.md")) ?? "";
-		if (hasBlockingContinuityIssues(report)) this.store.transition("revision");
+		const report = readContinuityReport(this.store.root, chapter);
+		const markdown = readText(join(this.store.root, "chapters", chapterKey(chapter), "continuity.md")) ?? "";
+		const blocking = report
+			? report.issues.some((issue) => issue.level === "blocker")
+			: hasBlockingContinuityIssues(markdown);
+		if (blocking) this.store.transition("revision");
 		else this.store.transition("line_edit");
 	}
 
@@ -440,7 +455,7 @@ export class WritingPipeline {
 		this.ensureChapterContext();
 		this.assertValid(await this.runRoleWithRetry("line_editor", { chapter: this.book.currentChapter, feedback }), "line_editor");
 		this.store.refreshStats();
-		if (isBetaReaderEnabled(this.config)) this.store.transition("reader");
+		if (isBetaReaderEnabled(this.book.config)) this.store.transition("reader");
 		else this.store.transition("chapter_gate");
 	}
 
@@ -450,17 +465,22 @@ export class WritingPipeline {
 		this.store.transition("chapter_gate");
 	}
 
-	async runChapterGate(reworkForFinal = false): Promise<void> {
+	async runChapterGate(): Promise<void> {
 		this.ensureChapterContext();
 		const chapter = this.book.currentChapter;
 		const key = chapterKey(chapter);
 		let round = 0;
 		const finalForAuto = readText(join(this.store.root, "chapters", key, "final.md")) ?? "";
 		if (finalForAuto.trim() && this.autoApproveChapterGate()) {
-			this.store.recordGate("chapter", "approved", { chapter, feedback: "chapterGate 配置自动通过" });
+			this.ensureContinuityBefore(chapter);
+			this.store.recordGate("chapter", "approved", {
+				chapter,
+				feedback: "chapterGate 配置自动通过",
+				artifactHash: computeGateHash(this.store.root, "chapter", chapter),
+			});
 			this.store.refreshStats();
 			this.store.transition("archive");
-			await this.runArchivist(reworkForFinal);
+			await this.runArchivist();
 			return;
 		}
 
@@ -471,6 +491,7 @@ export class WritingPipeline {
 			const summaryLines = [
 				`第 ${chapter} 章《${this.store.chapterTitle(chapter)}》`,
 				`字数：约 ${countChars(finalText)} 字`,
+				`连续性档案可信到第 ${this.book.continuityThrough} 章`,
 				`目录：${this.store.root}`,
 				"",
 				`定稿：chapters/${key}/final.md`,
@@ -486,15 +507,19 @@ export class WritingPipeline {
 				validationOk: finalText.trim().length > 0,
 				summary: summaryLines.filter(Boolean).join("\n"),
 				revisionRound: round,
-				maxRevisionRounds: this.config.defaults.maxRevisionRounds,
+				maxRevisionRounds: this.book.config.defaults.maxRevisionRounds,
 				signal: this.abortController?.signal,
 			});
 
 			if (decision.kind === "approve") {
-				this.store.recordGate("chapter", "approved", { chapter });
+				this.ensureContinuityBefore(chapter);
+				this.store.recordGate("chapter", "approved", {
+					chapter,
+					artifactHash: computeGateHash(this.store.root, "chapter", chapter),
+				});
 				this.store.refreshStats();
 				this.store.transition("archive");
-				await this.runArchivist(reworkForFinal);
+				await this.runArchivist();
 				return;
 			}
 			if (decision.kind === "pause" || decision.kind === "abort") {
@@ -504,40 +529,41 @@ export class WritingPipeline {
 			}
 			if (decision.kind === "revise") {
 				this.store.recordGate("chapter", "rejected", { chapter, feedback: decision.feedback });
+				this.prepareChapterRework(chapter);
 				round++;
 				await this.runReviser(decision.feedback);
 				await this.runLineEditor();
-				if (isBetaReaderEnabled(this.config)) await this.runBetaReader();
+				if (isBetaReaderEnabled(this.book.config)) await this.runBetaReader();
 				continue;
 			}
 			if (decision.kind === "rewrite") {
 				this.store.recordGate("chapter", "rejected", { chapter, feedback: decision.feedback });
+				this.prepareChapterRework(chapter);
 				round++;
 				await this.runChapterPlanner(decision.feedback);
 				await this.runWriter();
 				await this.runContinuity();
 				if (this.book.phase === "revision") await this.runReviser();
 				await this.runLineEditor();
-				if (isBetaReaderEnabled(this.config)) await this.runBetaReader();
+				if (isBetaReaderEnabled(this.book.config)) await this.runBetaReader();
 				continue;
 			}
 		}
 	}
 
-	async runArchivist(reworkForFinal = false): Promise<void> {
+	async runArchivist(): Promise<void> {
 		this.ensureChapterContext();
-		this.assertValid(await this.runRoleWithRetry("archivist", { chapter: this.book.currentChapter }), "archivist");
+		const chapter = this.book.currentChapter;
+		this.ensureContinuityBefore(chapter);
+		this.assertValid(await this.runRoleWithRetry("archivist", { chapter }), "archivist");
+		this.book.continuityThrough = Math.max(this.book.continuityThrough, chapter);
 		this.store.refreshStats();
-		if (reworkForFinal) {
-			this.store.transition("final_review");
-			return;
-		}
 		if (this.book.currentChapter < this.book.chapterCount) {
 			this.book.currentChapter += 1;
 			this.store.transition("chapter_plan");
 			notify(
 				this.ctx,
-				`第 ${this.book.currentChapter - 1} 章已完成。下一章：第 ${this.book.currentChapter} 章《${this.store.chapterTitle(this.book.currentChapter)}》。`,
+				`第 ${chapter} 章已完成。下一章：第 ${this.book.currentChapter} 章《${this.store.chapterTitle(this.book.currentChapter)}》。`,
 				"info",
 			);
 		} else {
@@ -559,12 +585,16 @@ export class WritingPipeline {
 				gate: "final",
 				summary: this.gateSummaryFor("final", attempt),
 				revisionRound: round,
-				maxRevisionRounds: this.config.defaults.maxRevisionRounds,
-				validationOk: attempt.validation.ok,
+				maxRevisionRounds: this.book.config.defaults.maxRevisionRounds,
+				allowApprove: attempt.validation.ok && this.allChaptersApproved(),
+				validationOk: attempt.validation.ok && this.allChaptersApproved(),
 				signal: this.abortController?.signal,
 			});
 			if (decision.kind === "approve") {
-				this.store.recordGate("final", "approved", { runId: attempt.runId });
+				this.store.recordGate("final", "approved", {
+					runId: attempt.runId,
+					artifactHash: computeGateHash(this.store.root, "final"),
+				});
 				this.store.transition("export");
 				await this.runExport();
 				return;
@@ -576,11 +606,16 @@ export class WritingPipeline {
 			}
 			if (decision.kind === "chapter_rework") {
 				this.store.recordGate("final", "rejected", { feedback: decision.feedback, runId: attempt.runId });
+				this.prepareChapterRework(decision.chapter);
 				this.book.currentChapter = decision.chapter;
+				this.book.gates.final = { status: "pending" };
+				this.store.save();
 				this.store.transition("chapter_plan");
-				notify(this.ctx, `开始返工第 ${decision.chapter} 章。`, "info");
-				await this.runChapterPipeline(true);
-				await this.runFinalReview();
+				notify(
+					this.ctx,
+					`已回退连续性档案到第 ${decision.chapter - 1} 章，并将从第 ${decision.chapter} 章起重新推进；完成后再进入终审。`,
+					"warning",
+				);
 				return;
 			}
 			if (decision.kind === "revise") {
@@ -612,46 +647,61 @@ export class WritingPipeline {
 		if (!gate) throw new Error(`当前阶段「${phaseLabel(this.book.phase)}」不是闸门`);
 		switch (gate) {
 			case "design": {
-				this.store.recordGate("design", "approved", { feedback });
-				this.store.transition(isWorldbuilderEnabled(this.config, this.book.intake.genre) ? "bible" : "outline");
+				this.assertExistingValid("architect");
+				this.store.recordGate("design", "approved", {
+					feedback,
+					artifactHash: computeGateHash(this.store.root, "design"),
+				});
+				this.store.transition(isWorldbuilderEnabled(this.book.config, this.book.intake.genre) ? "bible" : "outline");
 				await this.next();
 				return;
 			}
 			case "outline": {
+				this.assertExistingValid("outliner");
 				const manifest = readOutlineManifest(this.store.root);
 				if (!manifest) throw new Error("大纲 JSON 无法解析，不能通过");
 				if (!(readText(join(this.store.root, "outline.md")) ?? "").trim()) throw new Error("outline.md 缺失，不能通过");
-				this.store.recordGate("outline", "approved", { feedback });
-				this.book.chapterCount = manifest.chapterCount;
-				this.book.currentChapter = 1;
-				for (const chapter of manifest.chapters) {
-					this.book.gates.chapters[chapterKey(chapter.n)] ??= { status: "pending" };
-				}
-				this.store.save();
+				this.store.recordGate("outline", "approved", {
+					feedback,
+					artifactHash: computeGateHash(this.store.root, "outline"),
+				});
+				this.applyOutlineManifest(manifest);
 				this.store.transition("chapter_plan");
 				await this.next();
 				return;
 			}
 			case "chapter": {
-				if (!(readText(join(this.store.root, "chapters", chapterKey(this.book.currentChapter), "final.md")) ?? "").trim()) {
+				const chapter = this.book.currentChapter;
+				if (!(readText(join(this.store.root, "chapters", chapterKey(chapter), "final.md")) ?? "").trim()) {
 					throw new Error("本章 final.md 缺失，不能通过章节确认");
 				}
-				this.store.recordGate("chapter", "approved", { chapter: this.book.currentChapter, feedback });
+				this.assertExistingValid("line_editor", chapter);
+				this.ensureContinuityBefore(chapter);
+				this.store.recordGate("chapter", "approved", {
+					chapter,
+					feedback,
+					artifactHash: computeGateHash(this.store.root, "chapter", chapter),
+				});
 				this.store.refreshStats();
 				this.store.transition("archive");
 				await this.runArchivist();
 				return;
 			}
 			case "final": {
-				const review = readText(join(this.store.root, "reviews", "final-review.md")) ?? "";
-				if (!/VERDICT:\s*PASS/i.test(review)) {
-					if (this.config.defaults.fullAuto && /VERDICT:\s*REVISE/i.test(review)) {
+				if (!this.allChaptersApproved()) throw new Error("仍有章节未确认，不能通过终审");
+				this.assertExistingValid("chief_editor");
+				const review = readFinalReview(this.store.root);
+				if (review?.verdict !== "PASS") {
+					if (this.book.config.defaults.fullAuto && review?.verdict === "REVISE") {
 						notify(this.ctx, "全自动模式：主编结论为 VERDICT: REVISE，将带问题交付。", "warning");
 					} else {
 						throw new Error("终审结论不是 VERDICT: PASS，不能直接通过；请先修改或指定章节返工");
 					}
 				}
-				this.store.recordGate("final", "approved", { feedback });
+				this.store.recordGate("final", "approved", {
+					feedback,
+					artifactHash: computeGateHash(this.store.root, "final"),
+				});
 				this.store.transition("export");
 				await this.runExport();
 				return;
@@ -672,9 +722,10 @@ export class WritingPipeline {
 		}
 		if (gate === "chapter") {
 			this.store.recordGate("chapter", "rejected", { chapter: this.book.currentChapter, feedback });
+			this.prepareChapterRework(this.book.currentChapter);
 			await this.runReviser(feedback);
 			await this.runLineEditor();
-			if (isBetaReaderEnabled(this.config)) await this.runBetaReader();
+			if (isBetaReaderEnabled(this.book.config)) await this.runBetaReader();
 			await this.runChapterGate();
 			return;
 		}
@@ -684,50 +735,198 @@ export class WritingPipeline {
 	setChapter(n: number): void {
 		if (!Number.isInteger(n) || n < 1) throw new Error("章节号必须是正整数");
 		if (this.book.chapterCount > 0 && n > this.book.chapterCount) throw new Error(`章节号超出范围（1-${this.book.chapterCount}）`);
-		this.book.currentChapter = n;
-		if (!["chapter_plan", "draft", "continuity", "revision", "line_edit", "reader", "chapter_gate", "archive"].includes(this.book.phase)) {
-			this.book.phase = "chapter_plan";
+		const nextAllowed = Math.max(1, this.book.continuityThrough + 1);
+		if (n > nextAllowed) {
+			throw new Error(`第 ${n} 章之前还有未完成章节；连续性档案只到第 ${this.book.continuityThrough} 章，请先完成第 ${nextAllowed} 章`);
 		}
+		if (n <= this.book.continuityThrough) {
+			this.prepareChapterRework(n);
+			notify(
+				this.ctx,
+				`已回退连续性档案到第 ${n - 1} 章，第 ${n} 章及之后需要重新确认。`,
+				"warning",
+			);
+		}
+		this.book.currentChapter = n;
+		this.book.phase = "chapter_plan";
 		this.store.save();
 	}
 
 	rewind(phase: "design" | "outline" | "chapter_plan" | "final_review"): void {
 		this.book.previousPhase = undefined;
-		this.book.phase = phase;
-		const resetChapterGates = () => {
-			for (const gate of Object.values(this.book.gates.chapters)) {
+		this.book.lastError = undefined;
+		const resetChapterGates = (from = 1) => {
+			for (const [key, gate] of Object.entries(this.book.gates.chapters)) {
+				const n = Number(key.replace(/^ch/, ""));
+				if (!Number.isInteger(n) || n < from) continue;
 				gate.status = "pending";
 				gate.decidedAt = undefined;
 				gate.artifactVersion = undefined;
+				gate.artifactHash = undefined;
 			}
 		};
 		if (phase === "design") {
+			archiveBookPaths(this.store, "rewind-design", [
+				"chapters",
+				"continuity",
+				"reviews",
+				"design.md",
+				"style-guide.md",
+				"bible.md",
+				"outline.md",
+				"outline.json",
+			]);
 			this.book.gates.design = { status: "pending" };
 			this.book.gates.outline = { status: "pending" };
 			this.book.gates.final = { status: "pending" };
-			resetChapterGates();
+			this.book.gates.chapters = {};
 			this.book.chapterCount = 0;
 			this.book.currentChapter = 1;
+			this.book.continuityThrough = 0;
+			this.book.phase = "design";
 		} else if (phase === "outline") {
+			archiveBookPaths(this.store, "rewind-outline", ["chapters", "continuity", "reviews", "outline.md", "outline.json"]);
 			this.book.gates.outline = { status: "pending" };
 			this.book.gates.final = { status: "pending" };
-			resetChapterGates();
+			this.book.gates.chapters = {};
 			this.book.chapterCount = 0;
 			this.book.currentChapter = 1;
+			this.book.continuityThrough = 0;
+			this.book.phase = "outline";
 		} else if (phase === "chapter_plan") {
+			const chapter = this.book.currentChapter;
+			this.restoreContinuityTo(chapter - 1);
+			this.book.continuityThrough = chapter - 1;
+			resetChapterGates(chapter);
 			this.book.gates.final = { status: "pending" };
-			const key = chapterKey(this.book.currentChapter);
-			this.book.gates.chapters[key] = { status: "pending" };
-			this.store.refreshStats();
+			this.book.phase = "chapter_plan";
 		} else {
 			this.book.gates.final = { status: "pending" };
+			this.book.phase = "final_review";
 		}
 		this.store.save();
+		this.store.refreshStats();
+	}
+
+	/** Apply a newly approved outline, invalidating any previous chapter canon. */
+	private applyOutlineManifest(manifest: ReturnType<typeof readOutlineManifest>): void {
+		if (!manifest) throw new Error("大纲 JSON 无法解析，不能通过");
+		if (this.book.chapterCount > 0) archiveBookPaths(this.store, "outline-reapproved", ["chapters", "continuity", "reviews"]);
+		this.book.chapterCount = manifest.chapterCount;
+		this.book.currentChapter = 1;
+		this.book.continuityThrough = 0;
+		this.book.gates.chapters = {};
+		for (const chapter of manifest.chapters) {
+			this.book.gates.chapters[chapterKey(chapter.n)] = { status: "pending" };
+		}
+		this.book.gates.final = { status: "pending" };
+		this.store.save();
+	}
+
+	/** Restore canonical continuity files to the state after chapter `through`. */
+	private restoreContinuityTo(through: number): void {
+		const result = restoreCanon(this.store, through);
+		if (result.warning) notify(this.ctx, result.warning, "warning");
+	}
+
+	/** Ensure canon is at chapter-1 before archiving this chapter again. */
+	private ensureContinuityBefore(chapter: number): void {
+		if (this.book.continuityThrough >= chapter) {
+			this.restoreContinuityTo(chapter - 1);
+			this.book.continuityThrough = chapter - 1;
+			this.store.save();
+		}
+		if (this.book.continuityThrough < chapter - 1) {
+			throw new Error(
+				`连续性档案只到第 ${this.book.continuityThrough} 章，不能直接归档第 ${chapter} 章；请先补齐前面的章节`,
+			);
+		}
+	}
+
+	/** Invalidate the current chapter and every later chapter for a rework. */
+	private prepareChapterRework(chapter: number): void {
+		this.restoreContinuityTo(chapter - 1);
+		this.book.continuityThrough = chapter - 1;
+		for (let n = chapter; n <= this.book.chapterCount; n++) {
+			const gate = this.book.gates.chapters[chapterKey(n)] ?? { status: "pending" as const };
+			gate.status = "pending";
+			gate.decidedAt = undefined;
+			gate.artifactVersion = undefined;
+			gate.artifactHash = undefined;
+			this.book.gates.chapters[chapterKey(n)] = gate;
+		}
+		this.book.gates.final = { status: "pending" };
+		this.book.currentChapter = chapter;
+		this.store.save();
+	}
+
+	private allChaptersApproved(): boolean {
+		if (this.book.chapterCount <= 0) return false;
+		if (this.book.continuityThrough < this.book.chapterCount) return false;
+		for (let n = 1; n <= this.book.chapterCount; n++) {
+			const key = chapterKey(n);
+			if (this.book.gates.chapters[key]?.status !== "approved") return false;
+			if (!(readText(join(this.store.root, "chapters", key, "final.md")) ?? "").trim()) return false;
+		}
+		return true;
+	}
+
+	private assertExistingValid(role: RoleId, chapter?: number): void {
+		const targets = roleOutputTargets(role, chapter ?? this.book.currentChapter);
+		const validation = validateRoleOutputs({
+			role,
+			bookRoot: this.store.root,
+			targets,
+			book: this.book,
+			chapter,
+		});
+		if (!validation.ok) {
+			throw new Error(`${roleLabel(role)} 产出未通过校验：${validation.issues.join("；")}`);
+		}
 	}
 
 	// ---------------------------------------------------------------------
 	// Role execution
 	// ---------------------------------------------------------------------
+
+	/** Single dispatch point used by commands and the writing_team tool. */
+	async runRoleById(role: RoleId): Promise<void> {
+		switch (role) {
+			case "architect":
+				await this.runDesign();
+				return;
+			case "worldbuilder":
+				await this.runWorldbuilder();
+				return;
+			case "outliner":
+				await this.runOutline();
+				return;
+			case "chapter_planner":
+				await this.runChapterPlanner();
+				return;
+			case "writer":
+				await this.runWriter();
+				return;
+			case "continuity_editor":
+				await this.runContinuity();
+				return;
+			case "reviser":
+				await this.runReviser();
+				return;
+			case "line_editor":
+				await this.runLineEditor();
+				return;
+			case "beta_reader":
+				await this.runBetaReader();
+				return;
+			case "archivist":
+				await this.runArchivist();
+				return;
+			case "chief_editor":
+				await this.runFinalReview();
+				return;
+		}
+	}
 
 	private async runRoleWithRetry(role: RoleId, options: RunRoleOptions = {}): Promise<RoleAttempt> {
 		let attempt = await this.runRoleOnce(role, options);
@@ -744,15 +943,14 @@ export class WritingPipeline {
 
 	private async runRoleOnce(role: RoleId, options: RunRoleOptions): Promise<RoleAttempt> {
 		const chapter = this.book.currentChapter;
-		const needsChapter = ["chapter_planner", "writer", "continuity_editor", "reviser", "line_editor", "beta_reader", "archivist"].includes(role);
-		const actualChapter = options.chapter ?? (needsChapter ? chapter : undefined);
+		const actualChapter = options.chapter ?? (roleMeta(role).needsChapter ? chapter : undefined);
 		const phase = rolePhase(role);
 		this.store.acquireLock(role);
 		let run: RunRecord | undefined;
 		try {
 			this.store.transition(phase);
 			const targets = roleOutputTargets(role, actualChapter ?? chapter);
-			const inputFiles = this.existingInputFiles(role, actualChapter ?? chapter);
+			const inputFiles = roleInputs(role, this.store.root, actualChapter ?? chapter).map((input) => input.path);
 			run = this.store.beginRun(role, phase, {
 				chapter: actualChapter,
 				feedback: options.feedback,
@@ -763,7 +961,7 @@ export class WritingPipeline {
 				role,
 				book: this.book,
 				bookRoot: this.store.root,
-				config: this.config,
+				config: this.book.config,
 				chapter: actualChapter,
 				feedback: options.feedback,
 			});
@@ -781,15 +979,16 @@ export class WritingPipeline {
 				startedAt: run.startedAt,
 			});
 
-			const cfg = roleConfig(this.config, role);
+			const cfg = roleConfig(this.book.config, role);
 			const resolved = resolveModel(this.ctx, cfg.model);
 			if (resolved.warning) notify(this.ctx, resolved.warning, "warning");
-			const thinking = effectiveThinkingLevel(this.config, role);
+			const thinking = effectiveThinkingLevel(this.book.config, role);
 			let lastStatus = 0;
 			let liveUsage: RunUsage | undefined;
 			const progressPrefix = options.progressPrefix ?? roleLabel(role);
 
 			const runner = this.roleRunner ?? (await import("./runner.ts")).runRole;
+			const startedAtMs = Date.now();
 			const result = await runner({
 				bookRoot: this.store.root,
 				role,
@@ -825,14 +1024,30 @@ export class WritingPipeline {
 				targets,
 				book: this.book,
 				chapter: actualChapter,
+				runDir,
 			});
+			// Two-phase commit: official artifacts are only replaced after the
+			// whole run passes validation.
+			if (validation.ok) promoteRunArtifacts(runDir, targets, this.store.root);
+			const durationMs = Date.now() - startedAtMs;
+			const promptSha256 = sha256(`${system}\n\n${task}`);
+			const configSnapshot = {
+				model: result.model,
+				thinkingLevel: result.thinkingLevel,
+				configuredModel: cfg.model ?? null,
+				configuredThinkingLevel: thinking,
+			};
 			this.store.finishRun(run.id, {
 				status: "success",
-				outputFiles: result.outputs.length ? result.outputs : validation.ok ? targets : [],
+				outputFiles: validation.ok ? targets : [],
+				readFiles: result.readFiles,
 				usage: result.usage,
 				model: result.model,
 				thinkingLevel: result.thinkingLevel,
 				validation,
+				promptSha256,
+				durationMs,
+				configSnapshot,
 			});
 			writeJsonAtomic(join(runDir, "meta.json"), {
 				runId: run.id,
@@ -848,6 +1063,10 @@ export class WritingPipeline {
 				thinkingLevel: result.thinkingLevel,
 				usage: result.usage,
 				validation,
+				readFiles: result.readFiles,
+				promptSha256,
+				durationMs,
+				configSnapshot,
 				summary: result.finalText,
 			});
 			// Also keep a human-readable copy of the final summary.
@@ -880,6 +1099,7 @@ export class WritingPipeline {
 			book.phase,
 			book.currentChapter,
 			book.chapterCount,
+			book.continuityThrough,
 			book.stats.chaptersCompleted,
 			book.runs.length,
 			book.gates.design.status,
@@ -889,7 +1109,7 @@ export class WritingPipeline {
 	}
 
 	private autoApproveChapterGate(): boolean {
-		const mode = this.config.defaults.chapterGate;
+		const mode = this.book.config.defaults.chapterGate;
 		if (mode === "each") return false;
 		if (mode === "none") return true;
 		// "milestone": every third chapter and the final chapter.
@@ -901,105 +1121,6 @@ export class WritingPipeline {
 		const message = `${roleLabel(role)} 输出未通过校验：${attempt.validation.issues.join("；")}`;
 		this.store.markError(message, attempt.runId);
 		throw new Error(message);
-	}
-
-	private existingInputFiles(role: RoleId, chapter: number): string[] {
-		const ch = chapterKey(chapter);
-		const prev = chapter > 1 ? chapterKey(chapter - 1) : undefined;
-		const candidates: string[] = [];
-		const add = (path: string) => {
-			if (fileExists(join(this.store.root, path))) candidates.push(path);
-		};
-		switch (role) {
-			case "architect":
-				break;
-			case "worldbuilder":
-				add("design.md");
-				add("style-guide.md");
-				break;
-			case "outliner":
-				add("design.md");
-				add("style-guide.md");
-				add("bible.md");
-				break;
-			case "chapter_planner":
-				add("design.md");
-				add("style-guide.md");
-				add("bible.md");
-				add("outline.md");
-				add("outline.json");
-				add("continuity/characters.md");
-				add("continuity/timeline.md");
-				add("continuity/threads.md");
-				if (prev) add(`chapters/${prev}/final.md`);
-				break;
-			case "writer":
-				add(`chapters/${ch}/plan.md`);
-				add("design.md");
-				add("style-guide.md");
-				add("bible.md");
-				add("outline.md");
-				add("continuity/characters.md");
-				add("continuity/timeline.md");
-				add("continuity/threads.md");
-				if (prev) add(`chapters/${prev}/final.md`);
-				break;
-			case "continuity_editor":
-				add(`chapters/${ch}/draft.md`);
-				add(`chapters/${ch}/plan.md`);
-				add("design.md");
-				add("bible.md");
-				add("outline.md");
-				add("continuity/characters.md");
-				add("continuity/timeline.md");
-				add("continuity/threads.md");
-				add("continuity/world.md");
-				if (prev) add(`chapters/${prev}/final.md`);
-				break;
-			case "reviser":
-				add(`chapters/${ch}/draft.md`);
-				add(`chapters/${ch}/continuity.md`);
-				add(`chapters/${ch}/plan.md`);
-				add("style-guide.md");
-				add("continuity/characters.md");
-				add("continuity/timeline.md");
-				break;
-			case "line_editor":
-				add(`chapters/${ch}/revised.md`);
-				add(`chapters/${ch}/draft.md`);
-				add(`chapters/${ch}/plan.md`);
-				add("style-guide.md");
-				add("design.md");
-				break;
-			case "beta_reader":
-				add(`chapters/${ch}/final.md`);
-				add("design.md");
-				add("outline.md");
-				break;
-			case "archivist":
-				add(`chapters/${ch}/final.md`);
-				add(`chapters/${ch}/plan.md`);
-				add("bible.md");
-				add("continuity/characters.md");
-				add("continuity/timeline.md");
-				add("continuity/threads.md");
-				add("continuity/world.md");
-				add("continuity/summaries.md");
-				break;
-			case "chief_editor":
-				add("design.md");
-				add("outline.md");
-				add("outline.json");
-				add("continuity/summaries.md");
-				add("continuity/characters.md");
-				add("continuity/timeline.md");
-				add("continuity/threads.md");
-				for (let n = 1; n <= this.book.chapterCount; n++) {
-					add(`chapters/${chapterKey(n)}/final.md`);
-				}
-				break;
-		}
-		return candidates;
 	}
 
 	private gateSummaryFor(gate: GateId, attempt: RoleAttempt): string {
@@ -1047,6 +1168,12 @@ export class WritingPipeline {
 		if (this.book.chapterCount <= 0) throw new Error("还没有确认的大纲，无法开始章节写作");
 		if (this.book.currentChapter < 1 || this.book.currentChapter > this.book.chapterCount) {
 			throw new Error(`当前章节号 ${this.book.currentChapter} 超出范围`);
+		}
+		const nextAllowed = Math.max(1, this.book.continuityThrough + 1);
+		if (this.book.currentChapter > nextAllowed) {
+			throw new Error(
+				`连续性档案只到第 ${this.book.continuityThrough} 章，不能开始第 ${this.book.currentChapter} 章；请先完成第 ${nextAllowed} 章`,
+			);
 		}
 	}
 }

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { chapterKey, countChars, resolveWithin, slugify } from "../paths.ts";
 
@@ -20,4 +23,17 @@ test("countChars handles CJK and latin", () => {
 test("slugify is filesystem safe", () => {
 	assert.match(slugify("长夜将明"), /^book-\d{8}-\d{6}$/);
 	assert.match(slugify("Hello World"), /^hello-world-\d{8}-\d{6}$/);
+});
+
+test("resolveWithin rejects symlink escapes", () => {
+	const root = mkdtempSync(join(tmpdir(), "wt-path-root-"));
+	const outside = mkdtempSync(join(tmpdir(), "wt-path-outside-"));
+	try {
+		writeFileSync(join(outside, "secret.txt"), "secret");
+		symlinkSync(outside, join(root, "link"), "dir");
+		assert.throws(() => resolveWithin(root, "link/secret.txt"), /符号链接|路径越界/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+		rmSync(outside, { recursive: true, force: true });
+	}
 });

@@ -1,9 +1,10 @@
-import { readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolveWithin } from "./paths.ts";
 import type { BookStore } from "./state.ts";
 import type { GateId } from "./types.ts";
 import { notify } from "./ui.ts";
+import { readFinalReview } from "./validators.ts";
+
+export { gateArtifactPaths } from "./gate-hash.ts";
 
 export type GateDecision =
 	| { kind: "approve" }
@@ -26,39 +27,6 @@ export interface GateOptions {
 	signal?: AbortSignal;
 }
 
-export function gateArtifactPaths(gate: GateId, chapter?: number): string[] {
-	switch (gate) {
-		case "design":
-			return ["design.md", "style-guide.md"];
-		case "outline":
-			return ["outline.md", "outline.json"];
-		case "chapter": {
-			const key = `ch${String(chapter ?? 1).padStart(3, "0")}`;
-			return [
-				`chapters/${key}/plan.md`,
-				`chapters/${key}/continuity.md`,
-				`chapters/${key}/final.md`,
-			];
-		}
-		case "final":
-			return ["reviews/final-review.md"];
-	}
-}
-
-function readFiles(store: BookStore, paths: string[]): string {
-	const parts: string[] = [];
-	for (const rel of paths) {
-		try {
-			const path = resolveWithin(store.root, rel);
-			const text = readFileSync(path, "utf8");
-			parts.push(`\n\n===== ${rel} =====\n\n${text}`);
-		} catch {
-			// Missing optional files are fine.
-		}
-	}
-	return parts.join("");
-}
-
 export async function runGate(ctx: ExtensionContext, store: BookStore, options: GateOptions): Promise<GateDecision> {
 	if (!ctx.hasUI) {
 		notify(ctx, "当前模式没有交互 UI，无法进行人工确认；请在 TUI 中运行 /book。", "error");
@@ -79,9 +47,9 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 					: "终审确认";
 	const title = `《${book.title}》${gateName}`;
 	const summary = truncate(options.summary, 1200);
-	const reviewText = readFiles(store, gateArtifactPaths("final", chapter));
-	const hasVerdict = /VERDICT:\s*(PASS|REVISE)/i.test(reviewText);
-	const verdict = /VERDICT:\s*REVISE/i.test(reviewText) ? "REVISE" : "PASS";
+	const review = readFinalReview(store.root);
+	const hasVerdict = Boolean(review);
+	const verdict = review?.verdict ?? "PASS";
 	const allowApprove = options.allowApprove !== false && (options.gate !== "final" || hasVerdict);
 
 	if (book.config.defaults.fullAuto) {
@@ -112,7 +80,7 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 		optionsList.push("放弃本项目");
 		if (options.gate === "final") {
 			optionsList.push("指定章节返工");
-			if (hasVerdict && verdict === "REVISE") optionsList.push("带问题交付（不推荐）");
+			if (hasVerdict && verdict === "REVISE" && options.allowApprove !== false) optionsList.push("带问题交付（不推荐）");
 		}
 
 		const choice = await ctx.ui.select(
@@ -135,6 +103,10 @@ export async function runGate(ctx: ExtensionContext, store: BookStore, options: 
 		}
 
 		if (choice === "带问题交付（不推荐）") {
+			if (options.allowApprove === false) {
+				notify(ctx, "当前还有未完成的章节或校验问题，不能带问题交付。", "warning");
+				continue;
+			}
 			const ok = await ctx.ui.confirm("带问题交付", "主编认为仍需修改。确认忽略问题并交付？", { signal: options.signal });
 			if (ok) return { kind: "approve" };
 			continue;

@@ -948,3 +948,64 @@ Widget（编辑器上方）：
 - **确认闸门不展示全文**：G1/G2/G3/G4 都不展示工件全文，只显示摘要、字数和文件路径（如 `design.md`、`outline.md`、`final.md`、`reviews/final-review.md`），由用户自行打开确认。
 - **后台运行**：角色运行放在后台任务中，命令/工具立即返回；运行期间可执行 `/book status`、`/book doctor`、`/book abort` 等只读或中止命令。同一时间仍只允许一个后台任务。
 - **全自动连续写作**：全自动模式下 `/book next` 直接跑到完成，不再逐章等待 `/book next`；`/book step` 仍保留单步执行。
+
+---
+
+## 17. v0.3 增补（已实施）
+
+本节记录对 P0 / P1 问题的落地修改，避免与上文早期描述冲突。
+
+### 17.1 工件事务化
+
+- `save_artifact` 只写 `.runs/<runId>/` 暂存区，不再直接覆盖正式工件；
+- 输出校验读取暂存区，校验通过后由 pipeline 统一 promote；
+- 失败、取消、校验不通过时正式工件保持不变；
+- `.runs/<runId>/meta.json` 增加 `promptSha256`、`durationMs`、`readFiles`、`configSnapshot`，提高可复现性。
+
+### 17.2 连续性档案与回滚
+
+- `book.json` 增加 `continuityThrough`，表示 canon 已可信到第几章；
+- 章节写作前必须满足 `currentChapter <= continuityThrough + 1`；
+- 返工第 N 章时恢复 archivist 在第 N−1 章的快照，并把第 N 章及之后的章节确认重置；
+- 终审“指定章节返工”改为级联推进：从第 N 章重新跑章节流水线，完成后再终审；
+- `/book rewind design|outline` 会归档旧 `chapters/`、`continuity/`、`reviews/` 到 `archive/`；
+- archivist 的摘要更新改为幂等替换，而不是无条件追加。
+
+### 17.3 配置层级修正
+
+- `book.json` 的 `config` 只保存相对全局/项目配置的差异项；
+- `BookStore.save()` 通过 `diffConfig` 计算差异，避免初始化时的完整快照永久遮蔽后续配置；
+- 旧 schemaVersion 1 的 `book.json` 会被自动迁移为 schemaVersion 2，并对旧完整快照做差异提取。
+
+### 17.4 闸门校验与哈希
+
+- 大纲/设计闸门必须通过输出校验才能批准；
+- `outline.json` 强制章节号从 1 连续递增、`chapterCount === chapters.length`、章节数上限 1000；
+- 终审批准前要求所有章节已确认且 `final.md` 存在；
+- 每个闸门批准时记录 `artifactHash`；`/book doctor` 会检测审批后的工件修改。
+
+### 17.5 结构化契约
+
+- 连续性编辑同时产出 `continuity.md` 与 `continuity.json`；是否进入 revision 以 JSON 中的 `blocker` 为准；
+- 主编同时产出 `reviews/final-review.md` 与 `reviews/final-review.json`；
+- 角色输入清单统一由 `role-specs.ts` 提供，任务提示与运行记录不再各自维护一份。
+
+### 17.6 并发与锁
+
+- 书籍锁改为**整个后台任务持有**，角色运行使用可重入引用计数；
+- 锁文件每 30 秒更新心跳，长任务不会被 6 小时陈旧阈值误判；
+- `/book init`、配置修改、暂停/恢复等入口在繁忙时拒绝执行；
+- `session_shutdown` 会主动中止任务并释放锁；
+- 所有同步命令动作通过 `app.runExclusive()` 与后台任务互斥。
+
+### 17.7 运行记录
+
+- `book.json` 只保留最近 `defaults.keepRuns`（默认 200）条运行摘要；
+- 完整运行记录写入 `.runs/index.jsonl`；
+- 回滚时优先从 `.runs/index.jsonl` 和 `.runs/<runId>/` 快照恢复 canon。
+
+### 17.8 安全
+
+- `resolveWithin` 增加符号链接解析与逃逸检测；
+- 角色路径写入仍限制在声明目标内；
+- 只读工具本身没有内置文件系统沙箱，生产使用仍建议配合容器或受限工具。

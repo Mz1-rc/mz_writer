@@ -8,7 +8,16 @@ export interface BackgroundJob {
 	startedAt: number;
 	controller: AbortController;
 	done: boolean;
+	background: boolean;
 	error?: string;
+}
+
+export interface JobResult {
+	label: string;
+	startedAt: number;
+	endedAt: number;
+	error?: string;
+	background: boolean;
 }
 
 export class WritingTeamApp {
@@ -16,6 +25,8 @@ export class WritingTeamApp {
 	agentDir: string;
 	currentJob?: BackgroundJob;
 	currentAbort?: AbortController;
+	lastJob?: JobResult;
+	private lockedStores = new Set<BookStore>();
 
 	constructor(agentDir: string) {
 		this.agentDir = agentDir;
@@ -25,8 +36,9 @@ export class WritingTeamApp {
 		return loadTeamConfig(ctx.cwd, undefined, this.agentDir);
 	}
 
-	configFor(ctx: ExtensionContext, store: BookStore): TeamConfig {
-		return loadTeamConfig(ctx.cwd, store.book.config, this.agentDir);
+	/** Effective config already includes book-level overrides. */
+	configFor(_ctx: ExtensionContext, store: BookStore): TeamConfig {
+		return store.book.config;
 	}
 
 	ensure(ctx: ExtensionContext, slug?: string): { store: BookStore; config: TeamConfig } {
@@ -49,7 +61,7 @@ export class WritingTeamApp {
 		const config = this.baseConfig(ctx);
 		const store = createBook(ctx.cwd, title, intake, config);
 		this.active = store;
-		return { store, config };
+		return { store, config: store.book.config };
 	}
 
 	list(ctx: ExtensionContext): BookSummary[] {
@@ -67,12 +79,7 @@ export class WritingTeamApp {
 		return `后台任务运行中：${job.label}（已运行 ${seconds}s）。可使用 /book status 查看，/book abort 中止。`;
 	}
 
-	/**
-	 * Run a pipeline in the background so the Pi command handler returns
-	 * immediately. Only one job may run at a time; this is the same single-flight
-	 * guarantee as the role runner.
-	 */
-	startJob(label: string, runner: (controller: AbortController) => Promise<void>): BackgroundJob {
+	private beginJob(label: string, store?: BookStore): BackgroundJob {
 		if (this.isBusy()) throw new Error(this.busyMessage());
 		const controller = new AbortController();
 		const job: BackgroundJob = {
@@ -80,21 +87,79 @@ export class WritingTeamApp {
 			startedAt: Date.now(),
 			controller,
 			done: false,
+			background: true,
 		};
+		if (store) {
+			store.acquireLock(label);
+			this.lockedStores.add(store);
+		}
 		this.currentJob = job;
 		this.currentAbort = controller;
+		return job;
+	}
+
+	private finishJob(job: BackgroundJob, store?: BookStore): void {
+		job.done = true;
+		if (store) {
+			store.releaseLock();
+			this.lockedStores.delete(store);
+		}
+		this.lastJob = {
+			label: job.label,
+			startedAt: job.startedAt,
+			endedAt: Date.now(),
+			error: job.error,
+			background: job.background,
+		};
+		if (this.currentJob === job) this.currentJob = undefined;
+		if (this.currentAbort === job.controller) this.currentAbort = undefined;
+	}
+
+	/**
+	 * Run a pipeline in the background so the Pi command handler returns
+	 * immediately. Only one job may run at a time; the book lock is held for the
+	 * whole job, not just per role.
+	 */
+	startJob(label: string, runner: (controller: AbortController) => Promise<void>, store?: BookStore): BackgroundJob {
+		const job = this.beginJob(label, store);
 		void (async () => {
 			try {
-				await runner(controller);
+				await runner(job.controller);
 			} catch (error) {
 				job.error = error instanceof Error ? error.message : String(error);
 			} finally {
-				job.done = true;
-				if (this.currentJob === job) this.currentJob = undefined;
-				if (this.currentAbort === controller) this.currentAbort = undefined;
+				this.finishJob(job, store);
 			}
 		})();
 		return job;
+	}
+
+	/** Run a (usually short) pipeline action under the same exclusive lock. */
+	async runExclusive<T>(
+		label: string,
+		runner: (controller: AbortController) => Promise<T>,
+		store?: BookStore,
+	): Promise<T> {
+		const job = this.beginJob(label, store);
+		job.background = false;
+		try {
+			return await runner(job.controller);
+		} catch (error) {
+			job.error = error instanceof Error ? error.message : String(error);
+			throw error;
+		} finally {
+			this.finishJob(job, store);
+		}
+	}
+
+	/** Run a short synchronous mutation under the book's cross-process lock. */
+	withBookLock<T>(store: BookStore, fn: () => T): T {
+		store.acquireLock("book-mutation");
+		try {
+			return fn();
+		} finally {
+			store.releaseLock();
+		}
 	}
 
 	abortCurrent(): boolean {
@@ -102,5 +167,16 @@ export class WritingTeamApp {
 		this.currentAbort.abort();
 		this.currentAbort = undefined;
 		return true;
+	}
+
+	/** Release every held lock (session shutdown / emergency). */
+	releaseLocks(): void {
+		for (const store of this.lockedStores) store.forceReleaseLock();
+		this.lockedStores.clear();
+	}
+
+	shutdown(): void {
+		this.abortCurrent();
+		this.releaseLocks();
 	}
 }

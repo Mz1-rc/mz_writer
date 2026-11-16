@@ -66,3 +66,34 @@ test("role lock is single-flight", () => {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("pausing an errored book keeps a recoverable phase", () => {
+	const dir = mkdtempSync(join(tmpdir(), "wt-state-"));
+	try {
+		const store = createBook(dir, "状态测试", intake(), structuredClone(DEFAULT_CONFIG));
+		store.transition("design");
+		store.markError("模拟失败");
+		assert.equal(store.book.phase, "error");
+		store.pause();
+		assert.equal(store.book.phase, "paused");
+		store.resume();
+		assert.equal(store.book.phase, "design");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("lock is re-entrant and writes a heartbeat", () => {
+	const dir = mkdtempSync(join(tmpdir(), "wt-lock-"));
+	try {
+		const store = createBook(dir, "锁测试", intake(), structuredClone(DEFAULT_CONFIG));
+		store.acquireLock("job");
+		store.acquireLock("role");
+		store.releaseLock();
+		assert.equal(store.hasLock(), true, "nested release must keep the job lock");
+		store.releaseLock();
+		assert.equal(store.hasLock(), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

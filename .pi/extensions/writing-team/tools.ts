@@ -61,6 +61,7 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 			try {
 				switch (action) {
 					case "init": {
+						if (app.isBusy()) throw new Error(app.busyMessage());
 						const intake = await runIntake(ctx as any, params.title ?? "");
 						if (!intake) {
 							return {
@@ -95,7 +96,7 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 							if (roleForPhase(pipeline.book.phase) !== role) {
 								throw new Error(`当前阶段已变化，不能运行 ${role}。`);
 							}
-							await runRole(pipeline, role);
+							await pipeline.runRoleById(role);
 						});
 					}
 					case "approve": {
@@ -142,32 +143,38 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 						const role = params.role as RoleId | undefined;
 						if (!role || !ROLE_IDS.includes(role)) throw new Error("configure 需要有效的 role 参数");
 						const current = store.book.config.roles[role] ?? {};
-						store.book.config.roles[role] = {
+						const next = {
 							...current,
-							model: params.model?.trim() || current.model,
 							thinkingLevel: (params.thinkingLevel as ThinkingLevel | undefined) ?? current.thinkingLevel,
 						};
-						store.save();
+						if (params.model?.trim()) next.model = params.model.trim();
+						app.withBookLock(store, () => {
+							store.book.config.roles[role] = next;
+							store.save();
+						});
 						return toolResult(store, app);
 					}
 					case "pause": {
 						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
-						store.pause();
+						app.withBookLock(store, () => store.pause());
 						updateStatus(ctx, store);
 						return toolResult(store, app);
 					}
 					case "resume": {
 						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
-						store.resume();
+						app.withBookLock(store, () => store.resume());
 						updateStatus(ctx, store);
 						return toolResult(store, app);
 					}
 					case "set_auto": {
+						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
-						store.book.config.defaults.fullAuto = params.auto ?? true;
-						store.save();
+						app.withBookLock(store, () => {
+							store.book.config.defaults.fullAuto = params.auto ?? true;
+							store.save();
+						});
 						updateStatus(ctx, store);
 						return toolResult(store, app);
 					}
@@ -175,8 +182,10 @@ export function registerWritingTeamTool(pi: ExtensionAPI, app: WritingTeamApp): 
 						if (app.isBusy()) throw new Error(app.busyMessage());
 						const { store } = app.ensure(ctx);
 						if (!store.book.config.defaults.fullAuto) {
-							store.book.config.defaults.fullAuto = true;
-							store.save();
+							app.withBookLock(store, () => {
+								store.book.config.defaults.fullAuto = true;
+								store.save();
+							});
 							notify(ctx, "已自动开启全自动模式，开始运行剩余流程。", "warning");
 						}
 						return startToolPipeline(ctx, app, "全自动运行", (pipeline) => pipeline.runAll());
@@ -203,17 +212,22 @@ function startToolPipeline(
 	fn: (pipeline: WritingPipeline) => Promise<void>,
 ) {
 	const { store, config } = app.ensure(ctx);
-	app.startJob(label, async (controller) => {
-		const pipeline = new WritingPipeline(ctx, store, config, controller, undefined, false);
-		try {
-			await fn(pipeline);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			notify(ctx, controller.signal.aborted ? "后台任务已中止。" : message, controller.signal.aborted ? "warning" : "error");
-		} finally {
-			updateStatus(ctx, store);
-		}
-	});
+	app.startJob(
+		label,
+		async (controller) => {
+			const pipeline = new WritingPipeline(ctx, store, config, controller, undefined, false);
+			try {
+				await fn(pipeline);
+				notify(ctx, `✅ ${label}完成（${pipeline.book.phase}）。`, "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				notify(ctx, controller.signal.aborted ? "后台任务已中止。" : message, controller.signal.aborted ? "warning" : "error");
+			} finally {
+				updateStatus(ctx, store);
+			}
+		},
+		store,
+	);
 	updateStatus(ctx, store);
 	return toolResult(store, app, `⏳ 后台任务已启动：${label}。可使用 status 查看进度。`);
 }
@@ -223,18 +237,17 @@ async function withPipeline(
 	app: WritingTeamApp,
 	fn: (pipeline: WritingPipeline) => Promise<void>,
 ) {
-	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store, config } = app.ensure(ctx);
-	const controller = new AbortController();
-	app.currentAbort = controller;
-	const pipeline = new WritingPipeline(ctx, store, config, controller);
-	try {
-		await fn(pipeline);
-		updateStatus(ctx, store);
-		return toolResult(store, app);
-	} finally {
-		if (app.currentAbort === controller) app.currentAbort = undefined;
-	}
+	await app.runExclusive(
+		"写作团队操作",
+		async (controller) => {
+			const pipeline = new WritingPipeline(ctx, store, config, controller);
+			await fn(pipeline);
+			updateStatus(ctx, store);
+		},
+		store,
+	);
+	return toolResult(store, app);
 }
 
 function toolResult(store: import("./state.ts").BookStore, app?: WritingTeamApp, note?: string) {
@@ -245,11 +258,13 @@ function toolResult(store: import("./state.ts").BookStore, app?: WritingTeamApp,
 		`《${book.title}》`,
 		`阶段：${book.phase}`,
 		`章节：第 ${book.currentChapter}/${book.chapterCount || "?"} 章`,
+		`连续性档案：可信到第 ${book.continuityThrough} 章`,
 		`字数：${book.stats.words}`,
 		`Token：总 ${totalTokens}（入 ${book.stats.totalUsage?.input ?? 0} / 出 ${book.stats.totalUsage?.output ?? 0}）`,
 		`模式：${book.config.defaults.fullAuto ? "全自动" : "人工确认"}`,
 		`闸门：设计=${book.gates.design.status}, 大纲=${book.gates.outline.status}, 终审=${book.gates.final.status}`,
 		book.lastError ? `最近错误：${book.lastError.message}` : "",
+		app?.lastJob?.error ? `最近后台任务错误：${app.lastJob.error}` : "",
 		app?.currentJob ? `后台任务：${app.currentJob.label}（${Math.max(0, Math.round((Date.now() - app.currentJob.startedAt) / 1000))}s）` : "",
 	]
 		.filter(Boolean)
@@ -263,6 +278,7 @@ function toolResult(store: import("./state.ts").BookStore, app?: WritingTeamApp,
 			phase: book.phase,
 			currentChapter: book.currentChapter,
 			chapterCount: book.chapterCount,
+			continuityThrough: book.continuityThrough,
 			words: book.stats.words,
 			totalTokens,
 			fullAuto: book.config.defaults.fullAuto,
@@ -279,42 +295,3 @@ function toolResult(store: import("./state.ts").BookStore, app?: WritingTeamApp,
 		},
 	};
 }
-
-async function runRole(pipeline: WritingPipeline, role: RoleId): Promise<void> {
-	switch (role) {
-		case "architect":
-			await pipeline.runDesign();
-			return;
-		case "worldbuilder":
-			await pipeline.runWorldbuilder();
-			return;
-		case "outliner":
-			await pipeline.runOutline();
-			return;
-		case "chapter_planner":
-			await pipeline.runChapterPlanner();
-			return;
-		case "writer":
-			await pipeline.runWriter();
-			return;
-		case "continuity_editor":
-			await pipeline.runContinuity();
-			return;
-		case "reviser":
-			await pipeline.runReviser();
-			return;
-		case "line_editor":
-			await pipeline.runLineEditor();
-			return;
-		case "beta_reader":
-			await pipeline.runBetaReader();
-			return;
-		case "archivist":
-			await pipeline.runArchivist();
-			return;
-		case "chief_editor":
-			await pipeline.runFinalReview();
-			return;
-	}
-}
-

@@ -99,6 +99,7 @@ export async function runRole(options: RoleRunOptions): Promise<RoleRunResult> {
 
 	let streamedChars = 0;
 	let preview = "";
+	const readFiles = new Set<string>();
 	const usage = emptyUsage();
 	let lastContextAt = 0;
 	let cachedContext: ReturnType<typeof session.getContextUsage> | undefined;
@@ -128,6 +129,8 @@ export async function runRole(options: RoleRunOptions): Promise<RoleRunResult> {
 				preview = `${preview}${delta}`.slice(-160);
 				emit({ kind: "text", chars: streamedChars, text: preview, detail: `生成中 ${streamedChars} 字` });
 			} else if (event.type === "tool_execution_start") {
+				const args = event.args && typeof event.args === "object" ? event.args : {};
+				if (typeof args.path === "string") readFiles.add(args.path);
 				emit({ kind: "tool", toolName: event.toolName, detail: describeTool(event.toolName, event.args) });
 			} else if (event.type === "tool_execution_end") {
 				const duration = event.durationMs ? ` · ${event.durationMs}ms` : "";
@@ -165,6 +168,7 @@ export async function runRole(options: RoleRunOptions): Promise<RoleRunResult> {
 			outputs: [...manager.written.keys()],
 			model,
 			thinkingLevel: session.thinkingLevel,
+			readFiles: [...readFiles],
 		};
 	} finally {
 		if (options.signal) options.signal.removeEventListener("abort", onAbort);

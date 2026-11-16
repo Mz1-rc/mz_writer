@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
+import { ArtifactManager } from "../artifacts.ts";
 import { DEFAULT_CONFIG } from "../config.ts";
 import { WritingPipeline } from "../pipeline.ts";
 import { createBook } from "../state.ts";
@@ -41,6 +42,8 @@ function contentFor(role: string, target: string): string {
 		});
 	}
 	if (target.endsWith("final-review.md")) return "VERDICT: PASS\n\n终审通过。";
+	if (target.endsWith("final-review.json")) return JSON.stringify({ verdict: "PASS", blockers: [] });
+	if (target.endsWith("continuity.json")) return JSON.stringify({ summary: "无问题", issues: [] });
 	if (target.endsWith("continuity.md")) return "## 问题清单\n\n无问题";
 	if (target.includes("continuity/")) return `${role}\n${"档案".repeat(80)}`;
 	if (target.endsWith("style-guide.md")) return `风格指南\n${"风格".repeat(100)}`;
@@ -75,18 +78,17 @@ test("fake runner completes the whole pipeline with gates, never in parallel", a
 			maxActive = Math.max(maxActive, active);
 			try {
 				await new Promise((resolve) => setTimeout(resolve, 1));
+				const manager = new ArtifactManager(options.bookRoot, options.runDir, options.targets);
 				for (const target of options.targets) {
-					const path = join(options.bookRoot, target);
-					mkdirSync(dirname(path), { recursive: true });
-					writeFileSync(path, contentFor(options.role, target));
-					if (!existsSync(path)) throw new Error(`fake did not write ${target}`);
+					manager.write(target, contentFor(options.role, target));
 				}
 				return {
 					finalText: `${options.role} done`,
 					usage: { input: 1, output: 1, cost: 0 },
-					outputs: options.targets,
+					outputs: [...manager.written.keys()],
 					model: "fake/model",
 					thinkingLevel: "off",
+					readFiles: options.targets.filter((target) => target.endsWith("plan.md")),
 				};
 			} finally {
 				active--;
@@ -158,17 +160,15 @@ test("full-auto mode completes without any gate UI", async () => {
 		store.transition("design");
 
 		const fakeRunner = async (options: RoleRunOptions): Promise<RoleRunResult> => {
-			for (const target of options.targets) {
-				const path = join(options.bookRoot, target);
-				mkdirSync(dirname(path), { recursive: true });
-				writeFileSync(path, contentFor(options.role, target));
-			}
+			const manager = new ArtifactManager(options.bookRoot, options.runDir, options.targets);
+			for (const target of options.targets) manager.write(target, contentFor(options.role, target));
 			return {
 				finalText: `${options.role} done`,
 				usage: { input: 10, output: 5, cost: 0.001 },
-				outputs: options.targets,
+				outputs: [...manager.written.keys()],
 				model: "fake/model",
 				thinkingLevel: "off",
+				readFiles: [],
 			};
 		};
 
@@ -209,6 +209,132 @@ test("full-auto mode completes without any gate UI", async () => {
 		assert.ok(existsSync(join(store.root, "exports", "latest.md")));
 		assert.ok((store.book.stats.totalUsage.input ?? 0) > 0);
 		assert.ok((store.book.stats.totalUsage.output ?? 0) > 0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("rewind to an earlier chapter invalidates canon and allows a full re-run", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "wt-rewind-test-"));
+	try {
+		const config = structuredClone(DEFAULT_CONFIG);
+		config.defaults.thinkingLevel = "off";
+		config.defaults.enableWorldbuilder = "never";
+		config.defaults.enableBetaReader = false;
+		config.defaults.autoRunChapterPipeline = true;
+		config.defaults.chapterWords = 400;
+		config.defaults.totalWords = 800;
+		config.defaults.fullAuto = true;
+		const store = createBook(dir, "回滚测试", intake(), config);
+		store.transition("design");
+
+		const fakeRunner = async (options: RoleRunOptions): Promise<RoleRunResult> => {
+			const manager = new ArtifactManager(options.bookRoot, options.runDir, options.targets);
+			for (const target of options.targets) manager.write(target, contentFor(options.role, target));
+			return {
+				finalText: `${options.role} done`,
+				usage: { input: 1, output: 1, cost: 0 },
+				outputs: [...manager.written.keys()],
+				model: "fake/model",
+				thinkingLevel: "off",
+				readFiles: [],
+			};
+		};
+		const ui = {
+			input: async () => "1",
+			editor: async (_title: string, prefill?: string) => prefill ?? "",
+			select: async (_title: string, options: string[]) => options[0],
+			confirm: async () => true,
+			notify: () => {},
+			setStatus: () => {},
+			setWidget: () => {},
+		};
+		const ctx = {
+			cwd: dir,
+			ui,
+			hasUI: true,
+			mode: "tui",
+			signal: undefined,
+			isIdle: () => true,
+			scopedModels: [],
+			modelRegistry: { getAll: () => [], getAvailable: () => [], find: () => undefined },
+			sessionManager: {},
+			model: undefined,
+		};
+
+		const pipeline = new WritingPipeline(ctx as any, store, config, undefined, fakeRunner);
+		await pipeline.runAll();
+		assert.equal(store.book.phase, "done");
+		assert.equal(store.book.continuityThrough, 2);
+		assert.equal(store.book.gates.chapters.ch001.status, "approved");
+		assert.equal(store.book.gates.chapters.ch002.status, "approved");
+
+		pipeline.setChapter(1);
+		assert.equal(store.book.continuityThrough, 0);
+		assert.equal(store.book.gates.chapters.ch001.status, "pending");
+		assert.equal(store.book.gates.chapters.ch002.status, "pending");
+		assert.ok(existsSync(join(store.root, "archive")));
+
+		await pipeline.runAll();
+		assert.equal(store.book.phase, "done");
+		assert.equal(store.book.continuityThrough, 2);
+		assert.equal(store.book.gates.chapters.ch001.status, "approved");
+		assert.equal(store.book.gates.chapters.ch002.status, "approved");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("failed validation never promotes staged artifacts", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "wt-stage-fail-"));
+	try {
+		const config = structuredClone(DEFAULT_CONFIG);
+		config.defaults.thinkingLevel = "off";
+		config.defaults.enableWorldbuilder = "never";
+		config.defaults.chapterWords = 400;
+		const store = createBook(dir, "事务测试", intake(), config);
+		store.book.chapterCount = 1;
+		store.book.phase = "chapter_plan";
+		store.book.gates.chapters.ch001 = { status: "pending" };
+		store.save();
+
+		const fakeRunner = async (options: RoleRunOptions): Promise<RoleRunResult> => {
+			const manager = new ArtifactManager(options.bookRoot, options.runDir, options.targets);
+			for (const target of options.targets) manager.write(target, "太短");
+			return {
+				finalText: "short",
+				usage: { input: 1, output: 1, cost: 0 },
+				outputs: [...manager.written.keys()],
+				model: "fake/model",
+				thinkingLevel: "off",
+				readFiles: [],
+			};
+		};
+		const ui = {
+			input: async () => "",
+			editor: async (_title: string, prefill?: string) => prefill ?? "",
+			select: async (_title: string, options: string[]) => options[0],
+			confirm: async () => true,
+			notify: () => {},
+			setStatus: () => {},
+			setWidget: () => {},
+		};
+		const ctx = {
+			cwd: dir,
+			ui,
+			hasUI: true,
+			mode: "tui",
+			signal: undefined,
+			isIdle: () => true,
+			scopedModels: [],
+			modelRegistry: { getAll: () => [], getAvailable: () => [], find: () => undefined },
+			sessionManager: {},
+			model: undefined,
+		};
+		const pipeline = new WritingPipeline(ctx as any, store, config, undefined, fakeRunner);
+		await assert.rejects(() => pipeline.runChapterPlanner(), /未通过校验/);
+		assert.equal(existsSync(join(store.root, "chapters", "ch001", "plan.md")), false);
+		assert.ok(existsSync(join(store.root, ".runs")));
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

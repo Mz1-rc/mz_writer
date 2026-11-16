@@ -91,7 +91,9 @@ export function updateStatus(
 	const final = book.gates.final.status === "approved" ? "✔ 终审" : "○ 终审";
 	lines.push(`${design}   ${outline}   ${chapterProgress}   ${final}`);
 	if (book.chapterCount > 0) {
-		lines.push(`${progressBar(book.stats.chaptersCompleted, book.chapterCount)}  ${book.stats.chaptersCompleted}/${book.chapterCount} · ${phaseLabel(book.phase)}`);
+		lines.push(
+			`${progressBar(book.stats.chaptersCompleted, book.chapterCount)}  ${book.stats.chaptersCompleted}/${book.chapterCount} · ${phaseLabel(book.phase)} · 档案至第 ${book.continuityThrough} 章`,
+		);
 	} else {
 		lines.push(`当前：${phaseLabel(book.phase)}`);
 	}

@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readJson } from "./paths.ts";
-import type { RoleConfig, RoleId, TeamConfig, ThinkingLevel } from "./types.ts";
+import type { DeepPartial, RoleConfig, RoleId, TeamConfig, ThinkingLevel } from "./types.ts";
 
 export const DEFAULT_CONFIG: TeamConfig = {
 	language: "zh-CN",
@@ -16,6 +16,7 @@ export const DEFAULT_CONFIG: TeamConfig = {
 		chapterWords: 3200,
 		totalWords: 80000,
 		fullAuto: false,
+		keepRuns: 200,
 	},
 	roles: {},
 };
@@ -41,7 +42,11 @@ export function deepMerge<T>(base: T, patch: unknown): T {
 	return out as T;
 }
 
-export function loadTeamConfig(workspace: string, bookOverrides?: Partial<TeamConfig>, agentDir?: string): TeamConfig {
+export function loadTeamConfig(
+	workspace: string,
+	bookOverrides?: DeepPartial<TeamConfig> | undefined,
+	agentDir?: string,
+): TeamConfig {
 	const globalPath = join(agentDir ?? defaultAgentDir(), "writing-team.json");
 	const projectPath = join(workspace, ".pi", "writing-team.json");
 	let config = deepMerge(DEFAULT_CONFIG, readJson<Partial<TeamConfig>>(globalPath) ?? {});
@@ -52,6 +57,36 @@ export function loadTeamConfig(workspace: string, bookOverrides?: Partial<TeamCo
 		config.storageRoot = DEFAULT_CONFIG.storageRoot;
 	}
 	return config;
+}
+
+/**
+ * Compute the minimal override object that turns `base` into `current`.
+ * Used so book.json does not persist a full config snapshot that would shadow
+ * later global/project configuration changes.
+ */
+export function diffConfig(base: unknown, current: unknown): DeepPartial<TeamConfig> | undefined {
+	if (current === undefined) return undefined;
+	if (!isPlainObject(base) || !isPlainObject(current)) {
+		return JSON.stringify(base) === JSON.stringify(current) ? undefined : (current as DeepPartial<TeamConfig>);
+	}
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(current)) {
+		if (value === undefined) continue;
+		const baseValue = (base as Record<string, unknown>)[key];
+		if (isPlainObject(value) && isPlainObject(baseValue)) {
+			const nested = diffConfig(baseValue, value);
+			if (nested && Object.keys(nested).length > 0) out[key] = nested;
+			continue;
+		}
+		if (JSON.stringify(baseValue) !== JSON.stringify(value)) out[key] = value;
+	}
+	if (Object.keys(out).length === 0) return undefined;
+	return out as DeepPartial<TeamConfig>;
+}
+
+/** Merge a book-level override on top of an effective base config. */
+export function mergeBookConfig(base: TeamConfig, overrides: DeepPartial<TeamConfig> | undefined): TeamConfig {
+	return overrides ? deepMerge(base, overrides) : structuredClone(base);
 }
 
 export function roleConfig(config: TeamConfig, role: RoleId): RoleConfig {

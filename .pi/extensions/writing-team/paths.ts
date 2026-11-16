@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export function nowIso(): string {
 	return new Date().toISOString();
@@ -93,7 +93,7 @@ export function fileStat(path: string): { size: number; mtimeMs: number } | unde
 	}
 }
 
-/** Resolve a book-relative path, rejecting absolute paths and `..` escapes. */
+/** Resolve a book-relative path, rejecting absolute paths, `..` escapes and symlink escapes. */
 export function resolveWithin(root: string, rel: string): string {
 	const normalizedRel = rel.replaceAll("\\", "/");
 	if (!normalizedRel || isAbsolute(normalizedRel) || normalizedRel.startsWith("/")) {
@@ -101,11 +101,41 @@ export function resolveWithin(root: string, rel: string): string {
 	}
 	const rootAbs = resolve(root);
 	const target = resolve(rootAbs, normalizedRel);
-	const relToRoot = relative(rootAbs, target);
-	if (relToRoot.startsWith("..") || isAbsolute(relToRoot)) {
+	if (!isInside(rootAbs, target)) {
 		throw new Error(`路径越界: ${rel}`);
 	}
+
+	// Resolve existing path components so a symlink inside the book cannot
+	// redirect a write to a location outside the book root.
+	const rootReal = realPathOr(rootAbs);
+	let current = rootAbs;
+	for (const part of normalizedRel.split("/")) {
+		if (!part || part === ".") continue;
+		current = join(current, part);
+		try {
+			const stat = lstatSync(current);
+			const real = stat.isSymbolicLink() ? realpathSync(current) : realPathOr(current);
+			if (!isInside(rootReal, real)) throw new Error(`路径越界（符号链接）: ${rel}`);
+		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("路径越界")) throw error;
+			// Remaining components do not exist yet; no further symlinks can exist.
+			break;
+		}
+	}
 	return target;
+}
+
+function isInside(root: string, target: string): boolean {
+	const rel = relative(root, target);
+	return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+function realPathOr(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
 }
 
 export function sha256(text: string): string {

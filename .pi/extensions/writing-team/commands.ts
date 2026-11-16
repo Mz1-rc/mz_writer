@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { WritingTeamApp } from "./app.ts";
 import { runDoctor } from "./doctor.ts";
-import { roleLabel } from "./roles.ts";
+import { roleForPhase, roleLabel } from "./roles.ts";
 import { WritingPipeline } from "./pipeline.ts";
-import { formatTokens, updateStatus, notify } from "./ui.ts";
+import { formatTokens, phaseLabel, updateStatus, notify } from "./ui.ts";
 import { ROLE_IDS, type RoleId, type ThinkingLevel } from "./types.ts";
 
 const SUBCOMMANDS = [
@@ -144,21 +144,26 @@ function startPipeline(
 	fn: (pipeline: WritingPipeline) => Promise<void>,
 ): void {
 	const { store, config } = app.ensure(ctx);
-	app.startJob(label, async (controller) => {
-		const pipeline = new WritingPipeline(ctx, store, config, controller, undefined, false);
-		try {
-			await fn(pipeline);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (controller.signal.aborted) {
-				notify(ctx, "后台任务已中止。", "warning");
-			} else {
-				notify(ctx, message, "error");
+	app.startJob(
+		label,
+		async (controller) => {
+			const pipeline = new WritingPipeline(ctx, store, config, controller, undefined, false);
+			try {
+				await fn(pipeline);
+				notify(ctx, `✅ ${label}完成（${phaseLabel(pipeline.book.phase)}）。`, "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (controller.signal.aborted) {
+					notify(ctx, "后台任务已中止。", "warning");
+				} else {
+					notify(ctx, message, "error");
+				}
+			} finally {
+				updateStatus(ctx, store);
 			}
-		} finally {
-			updateStatus(ctx, store);
-		}
-	});
+		},
+		store,
+	);
 	notify(ctx, `⏳ 已启动后台任务：${label}。使用 /book status 查看进度。`, "info");
 }
 
@@ -167,21 +172,24 @@ async function withPipeline(
 	app: WritingTeamApp,
 	fn: (pipeline: WritingPipeline) => Promise<void>,
 ): Promise<void> {
-	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store, config } = app.ensure(ctx);
-	const controller = new AbortController();
-	app.currentAbort = controller;
-	const pipeline = new WritingPipeline(ctx, store, config, controller);
-	try {
-		await fn(pipeline);
-	} finally {
-		if (app.currentAbort === controller) app.currentAbort = undefined;
-		updateStatus(ctx, store);
-	}
+	await app.runExclusive(
+		"命令操作",
+		async (controller) => {
+			const pipeline = new WritingPipeline(ctx, store, config, controller);
+			try {
+				await fn(pipeline);
+			} finally {
+				updateStatus(ctx, store);
+			}
+		},
+		store,
+	);
 }
 
 async function initBook(ctx: ExtensionCommandContext, app: WritingTeamApp, titleArg: string): Promise<void> {
 	if (!ctx.hasUI) throw new Error("初始化需要交互 UI，请在 TUI 中运行");
+	if (app.isBusy()) throw new Error(app.busyMessage());
 	const existing = app.list(ctx);
 	if (existing.length > 0) {
 		const ok = await ctx.ui.confirm("已有书籍项目", `当前已有 ${existing.length} 个项目。仍然创建新书？`);
@@ -255,13 +263,15 @@ function showStatus(ctx: ExtensionCommandContext, app: WritingTeamApp): void {
 	const lines = [
 		`《${book.title}》`,
 		`项目：${book.slug}`,
-		`阶段：${book.phase}`,
+		`阶段：${phaseLabel(book.phase)}`,
+		`连续性档案：可信到第 ${book.continuityThrough} 章`,
 		`章节：第 ${book.currentChapter}/${book.chapterCount || "?"} 章`,
 		`字数：${book.stats.words.toLocaleString()}（已完成 ${book.stats.chaptersCompleted} 章）`,
 		`闸门：设计 ${gateText(book.gates.design)} / 大纲 ${gateText(book.gates.outline)} / 终审 ${gateText(book.gates.final)}`,
 		currentRun ? `运行中：${roleLabel(currentRun.role)}（${currentRun.startedAt}）` : "运行中：无",
 		app.currentJob ? `后台任务：${app.currentJob.label}（已运行 ${Math.max(0, Math.round((Date.now() - app.currentJob.startedAt) / 1000))}s）` : "",
 		book.lastError ? `最近错误：${book.lastError.message}` : "",
+		app.lastJob?.error ? `最近后台任务错误：${app.lastJob.error}` : "",
 		`目录：${store.root}`,
 		`模式：${book.config.defaults.fullAuto ? "⚡ 全自动（闸门自动通过）" : "人工确认"}`,
 		`Token：总 ${formatTokens(book.stats.totalUsage?.total ?? ((book.stats.totalUsage?.input ?? 0) + (book.stats.totalUsage?.output ?? 0)))}（入 ${formatTokens(book.stats.totalUsage?.input)} / 出 ${formatTokens(book.stats.totalUsage?.output)}）`,
@@ -283,65 +293,13 @@ async function runSpecificRole(pipeline: WritingPipeline, roleArg: string): Prom
 	if (!ROLE_IDS.includes(role)) {
 		throw new Error(`未知角色：${roleArg}。可用：${ROLE_IDS.join(", ")}`);
 	}
-	const currentRole = roleForCurrentPhase(pipeline);
+	const currentRole = roleForPhase(pipeline.book.phase);
 	if (currentRole !== role) {
 		throw new Error(
 			`当前阶段不能直接运行 ${role}。当前应运行：${currentRole ?? "无（请使用 /book next 或先通过闸门）"}`,
 		);
 	}
-	switch (role) {
-		case "architect":
-			await pipeline.runDesign();
-			return;
-		case "worldbuilder":
-			await pipeline.runWorldbuilder();
-			return;
-		case "outliner":
-			await pipeline.runOutline();
-			return;
-		case "chapter_planner":
-			await pipeline.runChapterPlanner();
-			return;
-		case "writer":
-			await pipeline.runWriter();
-			return;
-		case "continuity_editor":
-			await pipeline.runContinuity();
-			return;
-		case "reviser":
-			await pipeline.runReviser();
-			return;
-		case "line_editor":
-			await pipeline.runLineEditor();
-			return;
-		case "beta_reader":
-			await pipeline.runBetaReader();
-			return;
-		case "archivist":
-			await pipeline.runArchivist();
-			return;
-		case "chief_editor":
-			await pipeline.runFinalReview();
-			return;
-	}
-}
-
-function roleForCurrentPhase(pipeline: WritingPipeline): RoleId | undefined {
-	const phase = pipeline.book.phase;
-	const map: Record<string, RoleId> = {
-		design: "architect",
-		bible: "worldbuilder",
-		outline: "outliner",
-		chapter_plan: "chapter_planner",
-		draft: "writer",
-		continuity: "continuity_editor",
-		revision: "reviser",
-		line_edit: "line_editor",
-		reader: "beta_reader",
-		archive: "archivist",
-		final_review: "chief_editor",
-	};
-	return map[phase];
+	await pipeline.runRoleById(role);
 }
 
 async function rewind(ctx: ExtensionCommandContext, app: WritingTeamApp, arg: string): Promise<void> {
@@ -352,18 +310,18 @@ async function rewind(ctx: ExtensionCommandContext, app: WritingTeamApp, arg: st
 	if (!allowed.includes(target as (typeof allowed)[number])) {
 		throw new Error(`用法：/book rewind <${allowed.join("|")}>`);
 	}
-	const ok = await ctx.ui.confirm("回滚阶段", `确认回滚到 ${target}？现有工件不会删除，但后续阶段可能被标记为 stale。`);
+	const ok = await ctx.ui.confirm("回滚阶段", `确认回滚到 ${target}？旧章节与连续性档案会移动到 archive/，不会删除。`);
 	if (!ok) return;
-	const controller = new AbortController();
-	app.currentAbort = controller;
-	const pipeline = new WritingPipeline(ctx, store, config, controller);
-	try {
-		pipeline.rewind(target as (typeof allowed)[number]);
-		notify(ctx, `已回滚到 ${target}。`, "info");
-		updateStatus(ctx, store);
-	} finally {
-		app.currentAbort = undefined;
-	}
+	await app.runExclusive(
+		`回滚到 ${target}`,
+		async (controller) => {
+			const pipeline = new WritingPipeline(ctx, store, config, controller);
+			pipeline.rewind(target as (typeof allowed)[number]);
+			updateStatus(ctx, store);
+		},
+		store,
+	);
+	notify(ctx, `已回滚到 ${target}。`, "info");
 }
 
 async function configureRoleModel(ctx: ExtensionCommandContext, app: WritingTeamApp): Promise<void> {
@@ -389,17 +347,18 @@ async function configureRoleModel(ctx: ExtensionCommandContext, app: WritingTeam
 	const levelChoice = await ctx.ui.select("选择思考等级", levels);
 	if (!levelChoice) return;
 	const current = store.book.config.roles[role] ?? {};
-	store.book.config.roles[role] = {
-		...current,
-		model: modelChoice === "继承主会话模型" ? undefined : modelChoice,
-		thinkingLevel: levelChoice as ThinkingLevel,
-	};
-	store.save();
+	const next: typeof current = { ...current, thinkingLevel: levelChoice as ThinkingLevel };
+	if (modelChoice === "继承主会话模型") delete next.model;
+	else next.model = modelChoice;
+	app.withBookLock(store, () => {
+		store.book.config.roles[role] = next;
+		store.save();
+	});
 	notify(ctx, `${roleLabel(role)} 已设置为 ${modelChoice} / ${levelChoice}。`, "info");
 }
 
 function showConfig(ctx: ExtensionCommandContext, app: WritingTeamApp): void {
-	const { store, config } = app.ensure(ctx);
+	const { config } = app.ensure(ctx);
 	if (!ctx.hasUI) {
 		notify(ctx, JSON.stringify(config, null, 2), "info");
 		return;
@@ -463,15 +422,17 @@ function showHelp(ctx: ExtensionCommandContext): void {
 }
 
 async function setAutoMode(ctx: ExtensionCommandContext, app: WritingTeamApp, arg: string): Promise<void> {
+	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store } = app.ensure(ctx);
 	const value = arg.trim().toLowerCase();
-	if (value === "on" || value === "true" || value === "1") store.book.config.defaults.fullAuto = true;
-	else if (value === "off" || value === "false" || value === "0") store.book.config.defaults.fullAuto = false;
-	else {
+	if (value !== "on" && value !== "true" && value !== "1" && value !== "off" && value !== "false" && value !== "0") {
 		notify(ctx, `全自动模式当前为 ${store.book.config.defaults.fullAuto ? "开启" : "关闭"}。用法：/book auto on|off`, "info");
 		return;
 	}
-	store.save();
+	app.withBookLock(store, () => {
+		store.book.config.defaults.fullAuto = value === "on" || value === "true" || value === "1";
+		store.save();
+	});
 	updateStatus(ctx, store);
 	notify(
 		ctx,
@@ -486,8 +447,10 @@ async function runAll(ctx: ExtensionCommandContext, app: WritingTeamApp): Promis
 	if (app.isBusy()) throw new Error(app.busyMessage());
 	const { store } = app.ensure(ctx);
 	if (!store.book.config.defaults.fullAuto) {
-		store.book.config.defaults.fullAuto = true;
-		store.save();
+		app.withBookLock(store, () => {
+			store.book.config.defaults.fullAuto = true;
+			store.save();
+		});
 		notify(ctx, "⚡ 已自动开启全自动模式并开始运行。", "warning");
 	}
 	startPipeline(ctx, app, "全自动运行", (pipeline) => pipeline.runAll());

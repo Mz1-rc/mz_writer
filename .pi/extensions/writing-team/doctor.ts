@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseOutline } from "./artifacts.ts";
+import { computeGateHash } from "./gate-hash.ts";
 import { chapterKey } from "./paths.ts";
 import type { BookStore } from "./state.ts";
 
@@ -25,17 +26,22 @@ export function runDoctor(store: BookStore): DoctorIssue[] {
 	}
 	for (const run of book.runs) {
 		if (run.status === "running") {
-			issues.push({ level: "error", message: `运行 ${run.id} 仍标记为 running，可能是异常退出。` });
+			if (store.isLockLive()) {
+				issues.push({ level: "info", message: `运行 ${run.id}（${run.role}）仍在进行中（锁存活）。` });
+			} else {
+				issues.push({ level: "error", message: `运行 ${run.id} 仍标记为 running，可能是异常退出。` });
+			}
 		}
 		if (run.status === "error") {
 			issues.push({ level: "warning", message: `运行 ${run.id}（${run.role}）失败：${run.error ?? "未知错误"}` });
 		}
 	}
 
-	if (book.phase !== "intake" && book.phase !== "idle" && !existsSync(join(store.root, "design.md"))) {
+	const designExpected = !["intake", "idle", "design"].includes(book.phase);
+	if (designExpected && !existsSync(join(store.root, "design.md"))) {
 		issues.push({ level: "error", message: "缺少 design.md" });
 	}
-	if (["outline", "outline_gate", "chapter_plan", "draft", "continuity", "revision", "line_edit", "reader", "chapter_gate", "archive", "final_review", "final_gate", "export", "done"].includes(book.phase)) {
+	if (["outline_gate", "chapter_plan", "draft", "continuity", "revision", "line_edit", "reader", "chapter_gate", "archive", "final_review", "final_gate", "export", "done"].includes(book.phase)) {
 		const outlinePath = join(store.root, "outline.json");
 		if (!existsSync(outlinePath)) {
 			issues.push({ level: "error", message: "缺少 outline.json" });
@@ -61,6 +67,29 @@ export function runDoctor(store: BookStore): DoctorIssue[] {
 		}
 	}
 
+	checkGateHash(store, issues, "design", "设计", book.gates.design);
+	checkGateHash(store, issues, "outline", "大纲", book.gates.outline);
+	checkGateHash(store, issues, "final", "终审", book.gates.final);
+
+	if (book.chapterCount > 0) {
+		for (let n = 1; n <= book.chapterCount; n++) {
+			const key = chapterKey(n);
+			checkGateHash(store, issues, "chapter", `第 ${n} 章`, book.gates.chapters[key], n);
+			if (n <= book.continuityThrough && !existsSync(join(store.root, "continuity", "characters.md"))) {
+				issues.push({ level: "error", message: `连续性档案声称可信到第 ${book.continuityThrough} 章，但 continuity/characters.md 缺失` });
+				break;
+			}
+		}
+	}
+	if (book.continuityThrough > book.chapterCount) {
+		issues.push({ level: "warning", message: `continuityThrough=${book.continuityThrough} 超过 chapterCount=${book.chapterCount}` });
+	}
+	for (let n = book.continuityThrough + 1; n <= book.chapterCount; n++) {
+		if (book.gates.chapters[chapterKey(n)]?.status === "approved") {
+			issues.push({ level: "error", message: `第 ${n} 章已确认，但连续性档案只到第 ${book.continuityThrough} 章` });
+		}
+	}
+
 	if (book.phase === "final_gate" && !existsSync(join(store.root, "reviews", "final-review.md"))) {
 		issues.push({ level: "error", message: "缺少 reviews/final-review.md" });
 	}
@@ -69,4 +98,27 @@ export function runDoctor(store: BookStore): DoctorIssue[] {
 	}
 	if (issues.length === 0) issues.push({ level: "info", message: "状态与文件检查通过。" });
 	return issues;
+}
+
+function checkGateHash(
+	store: BookStore,
+	issues: DoctorIssue[],
+	gate: "design" | "outline" | "chapter" | "final",
+	label: string,
+	record: { status: string; artifactHash?: string } | undefined,
+	chapter?: number,
+): void {
+	if (!record || record.status !== "approved") return;
+	if (!record.artifactHash) {
+		issues.push({ level: "warning", message: `${label}已确认，但没有记录工件哈希（可能是旧版本审批）。` });
+		return;
+	}
+	const current = computeGateHash(store.root, gate, chapter ?? 1);
+	if (!current) {
+		issues.push({ level: "error", message: `${label}已确认，但审批工件缺失。` });
+		return;
+	}
+	if (current !== record.artifactHash) {
+		issues.push({ level: "error", message: `${label}的工件在确认后被修改，请重新确认或回滚。` });
+	}
 }

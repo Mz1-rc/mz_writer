@@ -49,6 +49,15 @@ export type Phase =
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+/** Recursive partial used to persist book-level config overrides only. */
+export type DeepPartial<T> = {
+	[P in keyof T]?: T[P] extends Array<infer U>
+		? Array<U>
+		: T[P] extends object
+			? DeepPartial<T[P]>
+			: T[P];
+};
+
 export interface RoleConfig {
 	enabled?: boolean;
 	model?: string;
@@ -69,6 +78,8 @@ export interface TeamConfig {
 		totalWords: number;
 		/** 全自动模式：跳过人工闸门确认（仍执行产出校验）。 */
 		fullAuto: boolean;
+		/** book.json 中保留的最近运行记录数量；完整记录在 .runs/index.jsonl。 */
+		keepRuns: number;
 	};
 	roles: Partial<Record<RoleId, RoleConfig>>;
 }
@@ -92,6 +103,8 @@ export interface GateRecord {
 	decidedAt?: string;
 	feedback?: string;
 	artifactVersion?: string;
+	/** 审批时工件内容哈希；用于发现审批后的外部修改。 */
+	artifactHash?: string;
 }
 
 export interface RunUsage {
@@ -114,11 +127,19 @@ export interface RunRecord {
 	thinkingLevel?: string;
 	inputFiles: string[];
 	outputFiles: string[];
+	/** 角色实际读取过的文件（来自 read/grep/find/ls 调用）。 */
+	readFiles?: string[];
 	revisionOf?: string;
 	feedback?: string;
 	usage?: RunUsage;
 	error?: string;
 	validation?: { ok: boolean; issues: string[] };
+	/** 本次提示词哈希，便于复现。 */
+	promptSha256?: string;
+	/** 运行耗时（毫秒）。 */
+	durationMs?: number;
+	/** 本次运行的关键配置快照。 */
+	configSnapshot?: Record<string, unknown>;
 }
 
 export interface OutlineChapter {
@@ -139,7 +160,7 @@ export interface OutlineManifest {
 }
 
 export interface BookProject {
-	schemaVersion: 1;
+	schemaVersion: 1 | 2;
 	slug: string;
 	title: string;
 	language: string;
@@ -150,6 +171,8 @@ export interface BookProject {
 	previousPhase?: Phase;
 	currentChapter: number;
 	chapterCount: number;
+	/** 连续性档案可信到第几章；下一章写作前必须满足 currentChapter <= continuityThrough + 1。 */
+	continuityThrough: number;
 
 	intake: Intake;
 	config: TeamConfig;
@@ -205,6 +228,7 @@ export interface RoleRunResult {
 	outputs: string[];
 	model?: string;
 	thinkingLevel?: string;
+	readFiles?: string[];
 }
 
 export interface RoleRunOptions {
